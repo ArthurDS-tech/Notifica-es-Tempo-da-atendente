@@ -700,13 +700,19 @@
                 const data = await response.json();
 
                 if (data.success) {
+                    const renderedMessage = (data.sentMessage || formData.message || '').replace(/\n/g, '<br>');
                     showResult('success', `
                         <h4>✅ Message Sent Successfully!</h4>
                         <p><strong>To:</strong> +${formData.phoneNumber}</p>
                         <p><strong>Type:</strong> ${formData.messageType === 'template' ? 'Template' : 'Simple'} Message</p>
                         <p><strong>Format:</strong> ${messageFormat === 'business' ? 'Professional Business' : messageFormat === 'organized' ? 'Organized Notification' : 'Simple'}</p>
-                        <p><strong>Message:</strong> ${formData.message}</p>
-                        ${data.data ? `<p><strong>Response ID:</strong> ${data.data.id || 'N/A'}</p>` : ''}
+                        <div style="margin-top:10px">
+                          <p><strong>Final Message:</strong></p>
+                          <div style="background:#f8f9fa;border:1px solid #e9ecef;padding:12px;border-radius:8px;font-family:system-ui, -apple-system, Segoe UI, Roboto, sans-serif;">
+                            ${renderedMessage}
+                          </div>
+                        </div>
+                        ${data.data ? `<p style="margin-top:10px"><strong>Response ID:</strong> ${data.data.id || 'N/A'}</p>` : ''}
                     `);
                     
                     // Clear form

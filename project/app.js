@@ -2,9 +2,12 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const path = require('path');
 const UTalkAPI = require('./config/api');
+const { getAttendantNameById } = require('./config/attendants');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const MANAGER_PHONE = process.env.MANAGER_PHONE; // digits only with country code
+const MANAGER_ATTENDANT_ID = process.env.MANAGER_ATTENDANT_ID; // optional ID mapping
 
 // Middleware
 app.use(bodyParser.json());
@@ -19,6 +22,49 @@ try {
   console.error('Failed to initialize UTalk API:', error.message);
   console.log('Please run: npm run setup');
   process.exit(1);
+}
+
+// In-memory store for idle timers per conversation (e.g., by contact phone or conversation id)
+const idleTimers = new Map();
+const IDLE_MS = 15 * 60 * 1000; // 15 minutes
+
+function scheduleIdleAlert(key, context) {
+  clearIdleAlert(key);
+  const timer = setTimeout(async () => {
+    try {
+      if (!MANAGER_PHONE) {
+        console.warn('Manager phone not configured; skipping idle alert');
+        return;
+      }
+      const organizationId = process.env.ORGANIZATION_ID;
+      const channelId = process.env.CHANNEL_ID;
+      const attendantName = getAttendantNameById(context.attendantId) || context.attendantName || 'Atendente';
+      const clientName = context.clientName || context.fromName || context.fromPhone;
+      const link = context.link || '';
+      const idleTime = '15 minutos';
+
+      const alertMessage = api.formatOrganizedNotification({
+        clientName,
+        attendantName,
+        idleTime,
+        link
+      });
+
+      console.log('Sending idle alert to manager:', { MANAGER_PHONE, clientName, attendantName });
+      await api.sendMessage(channelId, MANAGER_PHONE, alertMessage, organizationId);
+    } catch (err) {
+      console.error('Failed to send idle alert:', err.message);
+    }
+  }, IDLE_MS);
+  idleTimers.set(key, timer);
+}
+
+function clearIdleAlert(key) {
+  const t = idleTimers.get(key);
+  if (t) {
+    clearTimeout(t);
+    idleTimers.delete(key);
+  }
 }
 
 // Serve main page
@@ -62,6 +108,45 @@ app.get('/api/channel-status/:channelId', async (req, res) => {
       success: false,
       error: error.message
     });
+  }
+});
+
+// Webhook endpoint to receive UTalk events/messages
+// Configure this URL in UTalk dashboard (POST)
+app.post('/api/webhook/utalk', async (req, res) => {
+  try {
+    const event = req.body || {};
+    // Common fields we may receive (structure may vary by UTalk)
+    const type = event.type || event.event || '';
+    const message = event.message || event.payload || {};
+    const conversationId = message.conversationId || message.chatId || message.ticketId || null;
+    const fromPhone = (message.from && message.from.phone) || message.fromPhone || message.contactPhone || null;
+    const fromName = (message.from && message.from.name) || message.contactName || null;
+    const attendantId = message.attendantId || message.agentId || event.assignedTo || null;
+    const link = message.link || message.conversationLink || null;
+
+    // Build a key to track idle by conversation (fallback to phone)
+    const key = conversationId || fromPhone;
+
+    // When we get an inbound message from client, schedule idle alert
+    if (event.direction === 'in' || message.direction === 'in' || type === 'message-in') {
+      if (key) {
+        scheduleIdleAlert(key, { attendantId, attendantName: getAttendantNameById(attendantId), clientName: fromName, fromPhone, fromName, link });
+      }
+    }
+
+    // When outbound message (attendant replied), clear idle timer
+    if (event.direction === 'out' || message.direction === 'out' || type === 'message-out') {
+      if (key) {
+        clearIdleAlert(key);
+      }
+    }
+
+    // Acknowledge quickly
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Webhook handling error:', error);
+    res.status(200).json({ ok: true });
   }
 });
 
@@ -144,6 +229,7 @@ app.post('/api/send-message', async (req, res) => {
     res.json({
       success: true,
       data: result,
+      sentMessage: finalMessage,
       message: 'Message sent successfully!'
     });
 

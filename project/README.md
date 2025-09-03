@@ -198,6 +198,26 @@ Set `NODE_ENV=development` in `.env` for detailed API logs.
 ### Base URL
 ```
 https://app-utalk.umbler.com/api
+## 🔔 Webhook e Alerta de Inatividade (15 min)
+
+- Endpoint para configurar no UTalk (POST): `/api/webhook/utalk`
+- Comportamento:
+  - Mensagem de entrada (cliente) agenda alerta após 15 minutos sem resposta
+  - Mensagem de saída (atendente) cancela o alerta agendado
+  - Se expirar, envia mensagem ao gestor (`MANAGER_PHONE`) com o formato organizado
+
+### Variáveis de ambiente
+
+Adicione ao seu `.env`:
+
+```
+MANAGER_PHONE=5511999999999
+MANAGER_ATTENDANT_ID=aGevxChnIrrCytFy
+```
+
+- `MANAGER_PHONE`: telefone fixo (c/ DDI) que receberá alertas
+- `MANAGER_ATTENDANT_ID`: opcional, ID do atendente/gestor (para mapeamento de nome)
+
 ```
 
 ### Authentication
