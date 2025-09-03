@@ -119,6 +119,22 @@ function selectManagerWebhookForKey(key) {
   return null;
 }
 
+// Stats for admin
+const alertStats = {
+  totalAlertsSent: 0,
+  byManager: {},
+  byDay: {}
+};
+
+function recordAlertStat(targetKey, whenMs) {
+  alertStats.totalAlertsSent += 1;
+  if (targetKey) {
+    alertStats.byManager[targetKey] = (alertStats.byManager[targetKey] || 0) + 1;
+  }
+  const day = new Date(whenMs).toISOString().slice(0, 10);
+  alertStats.byDay[day] = (alertStats.byDay[day] || 0) + 1;
+}
+
 async function maybeSendDueAlerts(now = Date.now()) {
   const hasAnyManager = MANAGER_WEBHOOKS.length > 0 || MANAGER_PHONES.length > 0 || MANAGER_PHONE;
   if (!hasAnyManager) return;
@@ -153,9 +169,11 @@ async function maybeSendDueAlerts(now = Date.now()) {
             link,
             occurredAt: new Date(now).toISOString()
           }, { headers: { 'Content-Type': 'application/json' } });
+          recordAlertStat(managerWebhook, now);
         } else if (managerPhone) {
           console.log('Sending idle alert to manager phone:', { key, managerPhone, clientName, attendantName, minutes });
           await api.sendMessage(channelId, managerPhone, alertMessage, organizationId);
+          recordAlertStat(managerPhone, now);
         } else {
           console.warn('No manager target configured for key:', key);
         }
@@ -302,6 +320,7 @@ app.get('/api/webhook/utalk/debug', requireAdmin, (req, res) => {
       businessHours: { startHour: BUSINESS_START_HOUR, endHour: BUSINESS_END_HOUR },
       managerPhones: MANAGER_PHONES.length ? MANAGER_PHONES : (MANAGER_PHONE ? [MANAGER_PHONE] : []),
       managerWebhooks: MANAGER_WEBHOOKS,
+      stats: alertStats,
       recentCount: recentWebhookEvents.length,
       recentSample: recentWebhookEvents.slice(0, 20)
     });
@@ -318,6 +337,14 @@ app.post('/api/webhook/utalk/sweep', requireAdmin, async (req, res) => {
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
+});
+
+// Admin: reset stats
+app.post('/api/admin/reset-stats', requireAdmin, (req, res) => {
+  alertStats.totalAlertsSent = 0;
+  alertStats.byManager = {};
+  alertStats.byDay = {};
+  res.json({ success: true });
 });
 
 // Manual test endpoint to send an immediate alert to manager

@@ -53,6 +53,24 @@
           <div id="recent">-</div>
         </div>
       </div>
+      <div class="row" style="margin-top:12px">
+        <div>
+          <div class="muted small">Alertas Enviados (Total)</div>
+          <div id="statsTotal">-</div>
+        </div>
+        <div>
+          <div class="muted small">Por Gestora/Webhook</div>
+          <div id="statsByManager" class="small">-</div>
+        </div>
+        <div>
+          <div class="muted small">Por Dia</div>
+          <div id="statsByDay" class="small">-</div>
+        </div>
+        <div>
+          <div class="muted small">Ações</div>
+          <button id="resetStats" class="secondary">Resetar Estatísticas</button>
+        </div>
+      </div>
     </div>
 
     <div class="card">
@@ -93,6 +111,12 @@
         document.getElementById('biz').textContent = `${data.businessHours.startHour}:00–${data.businessHours.endHour}:00 (Mon–Fri)`;
         document.getElementById('managers').textContent = (data.managerPhones || []).join(', ') || '-';
         document.getElementById('recent').textContent = data.recentCount;
+        // Stats
+        document.getElementById('statsTotal').textContent = (data.stats && data.stats.totalAlertsSent) || 0;
+        const bm = (data.stats && data.stats.byManager) || {};
+        const bd = (data.stats && data.stats.byDay) || {};
+        document.getElementById('statsByManager').textContent = Object.keys(bm).length ? Object.entries(bm).map(([k,v])=>`${k}: ${v}`).join(' | ') : '-';
+        document.getElementById('statsByDay').textContent = Object.keys(bd).length ? Object.entries(bd).map(([k,v])=>`${k}: ${v}`).join(' | ') : '-';
         const tb = document.getElementById('conversations');
         tb.innerHTML = '';
         (data.conversations || []).forEach(c => {
@@ -111,6 +135,17 @@
         const res = await fetch('/api/webhook/utalk/sweep', { method: 'POST', headers: { 'X-Admin-Token': token } });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         alert('Sweep executado. Verifique se houve alertas.');
+      } catch (e) {
+        alert('Erro: ' + e.message);
+      }
+    });
+
+    document.getElementById('resetStats').addEventListener('click', async () => {
+      const token = document.getElementById('token').value.trim();
+      try {
+        const res = await fetch('/api/admin/reset-stats', { method: 'POST', headers: { 'X-Admin-Token': token } });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        alert('Estatísticas resetadas.');
       } catch (e) {
         alert('Erro: ' + e.message);
       }
