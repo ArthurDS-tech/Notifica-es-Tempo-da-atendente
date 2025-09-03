@@ -1,0 +1,706 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp UTalk Bot - Message Sender</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #25D366 0%, #128C7E 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+
+        .header {
+            background: #25D366;
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+
+        .header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+            font-weight: 600;
+        }
+
+        .header p {
+            font-size: 1.1rem;
+            opacity: 0.9;
+        }
+
+        .content {
+            padding: 40px;
+        }
+
+        .status-card {
+            background: #f8f9fa;
+            border: 1px solid #e9ecef;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 30px;
+        }
+
+        .status-title {
+            font-size: 1.2rem;
+            font-weight: 600;
+            margin-bottom: 15px;
+            color: #343a40;
+        }
+
+        .status-info {
+            display: grid;
+            gap: 10px;
+        }
+
+        .status-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #e9ecef;
+        }
+
+        .status-item:last-child {
+            border-bottom: none;
+        }
+
+        .status-label {
+            font-weight: 500;
+            color: #6c757d;
+        }
+
+        .status-value {
+            color: #343a40;
+            font-family: monospace;
+        }
+
+        .form-section {
+            background: #f8f9fa;
+            border-radius: 12px;
+            padding: 30px;
+            margin-bottom: 20px;
+        }
+
+        .form-title {
+            font-size: 1.4rem;
+            font-weight: 600;
+            margin-bottom: 20px;
+            color: #343a40;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+            color: #495057;
+        }
+
+        .form-input {
+            width: 100%;
+            padding: 12px 16px;
+            border: 2px solid #e9ecef;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: all 0.3s ease;
+        }
+
+        .form-input:focus {
+            outline: none;
+            border-color: #25D366;
+            box-shadow: 0 0 0 3px rgba(37, 211, 102, 0.1);
+        }
+
+        .form-textarea {
+            min-height: 100px;
+            resize: vertical;
+            font-family: inherit;
+        }
+
+        .form-select {
+            cursor: pointer;
+        }
+
+        .template-fields {
+            display: none;
+            margin-top: 15px;
+            padding-top: 15px;
+            border-top: 1px solid #e9ecef;
+        }
+
+        .template-fields.show {
+            display: block;
+        }
+
+        .btn {
+            display: inline-block;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            text-decoration: none;
+            text-align: center;
+        }
+
+        .btn-primary {
+            background: #25D366;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #128C7E;
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(37, 211, 102, 0.3);
+        }
+
+        .btn-primary:disabled {
+            background: #6c757d;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+
+        .btn-secondary {
+            background: #6c757d;
+            color: white;
+            margin-right: 10px;
+        }
+
+        .btn-secondary:hover {
+            background: #545b62;
+        }
+
+        .result-card {
+            margin-top: 30px;
+            padding: 20px;
+            border-radius: 12px;
+            display: none;
+        }
+
+        .result-success {
+            background: #d4edda;
+            border: 1px solid #c3e6cb;
+            color: #155724;
+        }
+
+        .result-error {
+            background: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+        }
+
+        .loading {
+            display: none;
+            text-align: center;
+            margin: 20px 0;
+        }
+
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #25D366;
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 10px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .footer {
+            background: #f8f9fa;
+            padding: 20px;
+            text-align: center;
+            color: #6c757d;
+            border-top: 1px solid #e9ecef;
+        }
+
+        .warning {
+            background: #fff3cd;
+            border: 1px solid #ffeaa7;
+            color: #856404;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+
+        .warning-title {
+            font-weight: 600;
+            margin-bottom: 5px;
+        }
+
+        @media (max-width: 768px) {
+            body {
+                padding: 10px;
+            }
+            
+            .header h1 {
+                font-size: 2rem;
+            }
+            
+            .content {
+                padding: 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📱 WhatsApp UTalk Bot</h1>
+            <p>Send WhatsApp messages via UTalk API v1</p>
+        </div>
+
+        <div class="content">
+            <!-- Status Section -->
+            <div class="status-card">
+                <div class="status-title">🔍 System Status</div>
+                <div class="status-info" id="statusInfo">
+                    <div class="status-item">
+                        <span class="status-label">Loading...</span>
+                        <span class="status-value">Please wait</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Warning Section -->
+            <div class="warning">
+                <div class="warning-title">⚠️ Important Usage Guidelines</div>
+                <ul style="margin-left: 20px; margin-top: 10px;">
+                    <li>Only send messages to people who have given consent</li>
+                    <li>Comply with WhatsApp Terms of Service and local laws</li>
+                    <li>Avoid spam or unsolicited marketing messages</li>
+                    <li>Respect rate limits: max 100 requests per 5 seconds</li>
+                </ul>
+            </div>
+
+            <!-- Message Form -->
+            <div class="form-section">
+                <div class="form-title">📤 Send WhatsApp Message</div>
+                
+                <form id="messageForm">
+                    <div class="form-group">
+                        <label class="form-label" for="phoneNumber">
+                            📞 Recipient Phone Number
+                        </label>
+                        <input 
+                            type="text" 
+                            id="phoneNumber" 
+                            class="form-input" 
+                            placeholder="554899895903 (country code + number, no spaces)"
+                            required
+                        >
+                        <small style="color: #6c757d; font-size: 0.9rem;">
+                            Example: 554899895903 (Brazil), 12345678901 (US)
+                        </small>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label" for="messageType">
+                            📋 Message Type
+                        </label>
+                        <select id="messageType" class="form-input form-select">
+                            <option value="simple">Simple Message</option>
+                            <option value="template">Template Message</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">
+                            📄 Message Format
+                        </label>
+                        <div style="display: flex; gap: 15px; margin-top: 8px;">
+                            <label style="display: flex; align-items: center; cursor: pointer;">
+                                <input type="radio" name="messageFormat" value="simple" checked style="margin-right: 8px;">
+                                Simple Message
+                            </label>
+                            <label style="display: flex; align-items: center; cursor: pointer;">
+                                <input type="radio" name="messageFormat" value="business" style="margin-right: 8px;">
+                                Professional Business Format
+                            </label>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="message">
+                            💬 Message Content
+                        </label>
+                        <textarea 
+                            id="message" 
+                            class="form-input form-textarea" 
+                            placeholder="Enter your message here..."
+                            required
+                        ></textarea>
+                    </div>
+
+                    <div class="business-fields" id="businessFields" style="display: none;">
+                        <div class="form-group">
+                            <label class="form-label" for="attendantName">
+                                👤 Atendente
+                            </label>
+                            <input 
+                                type="text" 
+                                id="attendantName" 
+                                class="form-input" 
+                                placeholder="Ex: João Silva"
+                            >
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label" for="location">
+                                📍 Local
+                            </label>
+                            <input 
+                                type="text" 
+                                id="location" 
+                                class="form-input" 
+                                placeholder="Ex: São Paulo - SP"
+                            >
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label" for="schedule">
+                                🕐 Horário
+                            </label>
+                            <input 
+                                type="text" 
+                                id="schedule" 
+                                class="form-input" 
+                                placeholder="Ex: Seg-Sex, 9h-18h"
+                            >
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label" for="link">
+                                🔗 Link (opcional)
+                            </label>
+                            <input 
+                                type="url" 
+                                id="link" 
+                                class="form-input" 
+                                placeholder="Ex: https://meusite.com"
+                            >
+                        </div>
+                    </div>
+                    <div class="template-fields" id="templateFields">
+                        <div class="form-group">
+                            <label class="form-label" for="templateName">
+                                🏷️ Template Name
+                            </label>
+                            <input 
+                                type="text" 
+                                id="templateName" 
+                                class="form-input" 
+                                placeholder="template_name"
+                            >
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label" for="parameters">
+                                📝 Parameters (optional)
+                            </label>
+                            <input 
+                                type="text" 
+                                id="parameters" 
+                                class="form-input" 
+                                placeholder="param1, param2, param3"
+                            >
+                            <small style="color: #6c757d; font-size: 0.9rem;">
+                                Comma-separated values for template variables
+                            </small>
+                        </div>
+                    </div>
+
+                    <button type="submit" class="btn btn-primary" id="sendButton">
+                        🚀 Send Message
+                    </button>
+                    
+                    <button type="button" class="btn btn-secondary" onclick="loadStatus()">
+                        🔄 Refresh Status
+                    </button>
+                </form>
+
+                <div class="loading" id="loading">
+                    <div class="spinner"></div>
+                    <p>Sending message...</p>
+                </div>
+
+                <div class="result-card" id="resultCard">
+                    <div id="resultContent"></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="footer">
+            <p>
+                💻 <strong>WhatsApp UTalk Bot</strong> | 
+                🔗 Powered by <a href="https://umbler.com" target="_blank">Umbler UTalk API</a> | 
+                ⚡ Built with Node.js & Express
+            </p>
+        </div>
+    </div>
+
+    <script>
+        // Load status on page load
+        document.addEventListener('DOMContentLoaded', loadStatus);
+
+        // Handle message type change
+        document.getElementById('messageType').addEventListener('change', function() {
+            const templateFields = document.getElementById('templateFields');
+            if (this.value === 'template') {
+                templateFields.classList.add('show');
+            } else {
+                templateFields.classList.remove('show');
+            }
+        });
+
+        // Handle message format change
+        document.querySelectorAll('input[name="messageFormat"]').forEach(radio => {
+            radio.addEventListener('change', function() {
+                const businessFields = document.getElementById('businessFields');
+                if (this.value === 'business') {
+                    businessFields.style.display = 'block';
+                } else {
+                    businessFields.style.display = 'none';
+                }
+            });
+        });
+        // Handle form submission
+        document.getElementById('messageForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            await sendMessage();
+        });
+
+        async function loadStatus() {
+            try {
+                const response = await fetch('/api/info');
+                const data = await response.json();
+                
+                const statusInfo = document.getElementById('statusInfo');
+                
+                if (data.success) {
+                    statusInfo.innerHTML = `
+                        <div class="status-item">
+                            <span class="status-label">API Status</span>
+                            <span class="status-value" style="color: #28a745;">✅ Connected</span>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-label">User</span>
+                            <span class="status-value">${data.user.name || 'Unknown'}</span>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-label">Organization ID</span>
+                            <span class="status-value">${data.config.organizationId || 'Not set'}</span>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-label">Channel ID</span>
+                            <span class="status-value">${data.config.channelId || 'Not set'}</span>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-label">Available Channels</span>
+                            <span class="status-value">${data.channels.length} channel(s)</span>
+                        </div>
+                    `;
+
+                    // Check channel status if we have a channel ID
+                    if (data.config.channelId) {
+                        checkChannelStatus(data.config.channelId);
+                    }
+                } else {
+                    statusInfo.innerHTML = `
+                        <div class="status-item">
+                            <span class="status-label">API Status</span>
+                            <span class="status-value" style="color: #dc3545;">❌ Error</span>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-label">Error</span>
+                            <span class="status-value">${data.error}</span>
+                        </div>
+                    `;
+                }
+            } catch (error) {
+                document.getElementById('statusInfo').innerHTML = `
+                    <div class="status-item">
+                        <span class="status-label">Connection</span>
+                        <span class="status-value" style="color: #dc3545;">❌ Failed to connect</span>
+                    </div>
+                `;
+            }
+        }
+
+        async function checkChannelStatus(channelId) {
+            try {
+                const response = await fetch(`/api/channel-status/${channelId}`);
+                const data = await response.json();
+                
+                if (data.success && data.channel) {
+                    const statusInfo = document.getElementById('statusInfo');
+                    const channelStatusHtml = `
+                        <div class="status-item">
+                            <span class="status-label">Channel Status</span>
+                            <span class="status-value" style="color: ${getStatusColor(data.channel.status)};">
+                                ${getStatusIcon(data.channel.status)} ${data.channel.status || 'Active'}
+                            </span>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-label">Channel Name</span>
+                            <span class="status-value">${data.channel.name}</span>
+                        </div>
+                    `;
+                    statusInfo.innerHTML += channelStatusHtml;
+                }
+            } catch (error) {
+                console.error('Failed to check channel status:', error);
+            }
+        }
+
+        function getStatusColor(status) {
+            switch (status) {
+                case 'connected':
+                case 'active':
+                    return '#28a745';
+                case 'disconnected':
+                case 'pending':
+                    return '#ffc107';
+                default:
+                    return '#6c757d';
+            }
+        }
+
+        function getStatusIcon(status) {
+            switch (status) {
+                case 'connected':
+                case 'active':
+                    return '🟢';
+                case 'disconnected':
+                    return '🔴';
+                case 'pending':
+                    return '🟡';
+                default:
+                    return '⚪';
+            }
+        }
+
+        async function sendMessage() {
+            const sendButton = document.getElementById('sendButton');
+            const loading = document.getElementById('loading');
+            const resultCard = document.getElementById('resultCard');
+            const resultContent = document.getElementById('resultContent');
+
+            // Get message format
+            const messageFormat = document.querySelector('input[name="messageFormat"]:checked').value;
+            // Get form data
+            const formData = {
+                phoneNumber: document.getElementById('phoneNumber').value,
+                message: document.getElementById('message').value,
+                messageType: document.getElementById('messageType').value,
+                templateName: document.getElementById('templateName').value,
+                parameters: document.getElementById('parameters').value,
+                useBusinessFormat: messageFormat === 'business',
+                attendantName: document.getElementById('attendantName')?.value || '',
+                location: document.getElementById('location')?.value || '',
+                schedule: document.getElementById('schedule')?.value || '',
+                link: document.getElementById('link')?.value || ''
+            };
+
+            // Validate
+            if (!formData.phoneNumber || !formData.message) {
+                showResult('error', 'Phone number and message are required');
+                return;
+            }
+
+            // Show loading
+            sendButton.disabled = true;
+            loading.style.display = 'block';
+            resultCard.style.display = 'none';
+
+            try {
+                const response = await fetch('/api/send-message', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(formData)
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    showResult('success', `
+                        <h4>✅ Message Sent Successfully!</h4>
+                        <p><strong>To:</strong> +${formData.phoneNumber}</p>
+                        <p><strong>Type:</strong> ${formData.messageType === 'template' ? 'Template' : 'Simple'} Message</p>
+                        <p><strong>Format:</strong> ${messageFormat === 'business' ? 'Professional Business' : 'Simple'}</p>
+                        <p><strong>Message:</strong> ${formData.message}</p>
+                        ${data.data ? `<p><strong>Response ID:</strong> ${data.data.id || 'N/A'}</p>` : ''}
+                    `);
+                    
+                    // Clear form
+                    document.getElementById('messageForm').reset();
+                    document.getElementById('templateFields').classList.remove('show');
+                    document.getElementById('businessFields').style.display = 'none';
+                    document.querySelector('input[name="messageFormat"][value="simple"]').checked = true;
+                } else {
+                    showResult('error', `
+                        <h4>❌ Failed to Send Message</h4>
+                        <p><strong>Error:</strong> ${data.error}</p>
+                        ${data.error.includes('Rate Limit') ? '<p><strong>Tip:</strong> Wait a few seconds before trying again.</p>' : ''}
+                        ${data.error.includes('Unauthorized') ? '<p><strong>Tip:</strong> Check your API token configuration.</p>' : ''}
+                        ${data.error.includes('Business API') ? '<p><strong>Tip:</strong> Your account may need Business API access. Contact Umbler support.</p>' : ''}
+                    `);
+                }
+            } catch (error) {
+                showResult('error', `
+                    <h4>❌ Network Error</h4>
+                    <p><strong>Error:</strong> ${error.message}</p>
+                    <p><strong>Tip:</strong> Check your internet connection and try again.</p>
+                `);
+            }
+
+            // Hide loading
+            sendButton.disabled = false;
+            loading.style.display = 'none';
+        }
+
+        function showResult(type, content) {
+            const resultCard = document.getElementById('resultCard');
+            const resultContent = document.getElementById('resultContent');
+
+            resultCard.className = `result-card result-${type}`;
+            resultContent.innerHTML = content;
+            resultCard.style.display = 'block';
+
+            // Auto-hide after 10 seconds for success messages
+            if (type === 'success') {
+                setTimeout(() => {
+                    resultCard.style.display = 'none';
+                }, 10000);
+            }
+        }
+    </script>
+</body>
+</html>
