@@ -343,6 +343,10 @@
                                 <input type="radio" name="messageFormat" value="business" style="margin-right: 8px;">
                                 Professional Business Format
                             </label>
+                            <label style="display: flex; align-items: center; cursor: pointer;">
+                                <input type="radio" name="messageFormat" value="organized" style="margin-right: 8px;">
+                                Organized Notification Format
+                            </label>
                         </div>
                     </div>
                     <div class="form-group">
@@ -403,6 +407,43 @@
                                 id="link" 
                                 class="form-input" 
                                 placeholder="Ex: https://meusite.com"
+                            >
+                        </div>
+                    </div>
+                    <div class="business-fields" id="organizedFields" style="display: none;">
+                        <div class="form-group">
+                            <label class="form-label" for="clientName">
+                                👤 Cliente nome
+                            </label>
+                            <input 
+                                type="text" 
+                                id="clientName" 
+                                class="form-input" 
+                                placeholder="Ex: Maria Souza"
+                            >
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label" for="idleTime">
+                                ⏱️ Tempo sem resposta
+                            </label>
+                            <input 
+                                type="text" 
+                                id="idleTime" 
+                                class="form-input" 
+                                placeholder="Ex: 2h 15m"
+                            >
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label" for="linkOrganized">
+                                🔗 Link (opcional)
+                            </label>
+                            <input 
+                                type="url" 
+                                id="linkOrganized" 
+                                class="form-input" 
+                                placeholder="Ex: https://meusite.com/atendimento/123"
                             >
                         </div>
                     </div>
@@ -482,10 +523,16 @@
         document.querySelectorAll('input[name="messageFormat"]').forEach(radio => {
             radio.addEventListener('change', function() {
                 const businessFields = document.getElementById('businessFields');
+                const organizedFields = document.getElementById('organizedFields');
                 if (this.value === 'business') {
                     businessFields.style.display = 'block';
+                    organizedFields.style.display = 'none';
+                } else if (this.value === 'organized') {
+                    organizedFields.style.display = 'block';
+                    businessFields.style.display = 'none';
                 } else {
                     businessFields.style.display = 'none';
+                    organizedFields.style.display = 'none';
                 }
             });
         });
@@ -621,10 +668,13 @@
                 templateName: document.getElementById('templateName').value,
                 parameters: document.getElementById('parameters').value,
                 useBusinessFormat: messageFormat === 'business',
+                useOrganizedFormat: messageFormat === 'organized',
                 attendantName: document.getElementById('attendantName')?.value || '',
                 location: document.getElementById('location')?.value || '',
                 schedule: document.getElementById('schedule')?.value || '',
-                link: document.getElementById('link')?.value || ''
+                link: (messageFormat === 'organized' ? document.getElementById('linkOrganized')?.value : document.getElementById('link')?.value) || '',
+                clientName: document.getElementById('clientName')?.value || '',
+                idleTime: document.getElementById('idleTime')?.value || ''
             };
 
             // Validate
@@ -654,7 +704,7 @@
                         <h4>✅ Message Sent Successfully!</h4>
                         <p><strong>To:</strong> +${formData.phoneNumber}</p>
                         <p><strong>Type:</strong> ${formData.messageType === 'template' ? 'Template' : 'Simple'} Message</p>
-                        <p><strong>Format:</strong> ${messageFormat === 'business' ? 'Professional Business' : 'Simple'}</p>
+                        <p><strong>Format:</strong> ${messageFormat === 'business' ? 'Professional Business' : messageFormat === 'organized' ? 'Organized Notification' : 'Simple'}</p>
                         <p><strong>Message:</strong> ${formData.message}</p>
                         ${data.data ? `<p><strong>Response ID:</strong> ${data.data.id || 'N/A'}</p>` : ''}
                     `);

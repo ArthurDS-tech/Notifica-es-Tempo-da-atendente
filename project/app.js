@@ -78,7 +78,10 @@ app.post('/api/send-message', async (req, res) => {
       attendantName,
       location,
       schedule,
-      link
+      link,
+      useOrganizedFormat,
+      clientName,
+      idleTime
     } = req.body;
 
     // Validate input
@@ -108,8 +111,16 @@ app.post('/api/send-message', async (req, res) => {
       });
     }
 
-    // Format message if business format is requested
+    // Format message if organized or business format is requested
     let finalMessage = message;
+    if (useOrganizedFormat === 'true') {
+      finalMessage = api.formatOrganizedNotification({
+        clientName,
+        attendantName,
+        idleTime,
+        link
+      });
+    } else 
     if (useBusinessFormat === 'true') {
       finalMessage = api.formatBusinessMessage(message, attendantName, location, schedule, link);
     }
@@ -118,7 +129,7 @@ app.post('/api/send-message', async (req, res) => {
     if (messageType === 'template' && templateName) {
       // Send template message
       const templateParams = parameters ? parameters.split(',').map(p => p.trim()) : [];
-      result = await api.sendTemplateMessage(channelId, cleanPhoneNumber, finalMessage, templateParams, organizationId);
+      result = await api.sendTemplateMessage(channelId, cleanPhoneNumber, templateName, templateParams, organizationId);
     } else {
       // Send simple message
       console.log('Sending message with params:', {

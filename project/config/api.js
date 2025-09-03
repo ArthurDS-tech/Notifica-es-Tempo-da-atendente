@@ -3,7 +3,7 @@ require('dotenv').config();
 
 class UTalkAPI {
   constructor() {
-    this.baseURL = process.env.UTALK_BASE_URL || 'https://api.utalk.chat/v1';
+    this.baseURL = (process.env.UTALK_BASE_URL || 'https://app-utalk.umbler.com/api').replace(/\/$/, '');
     this.token = process.env.UTALK_API_TOKEN;
     
     if (!this.token) {
@@ -14,9 +14,7 @@ class UTalkAPI {
       baseURL: this.baseURL,
       headers: {
         'Authorization': `Bearer ${this.token}`,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'X-Organization-Id': process.env.ORGANIZATION_ID
+        'Accept': 'application/json'
       },
       timeout: 30000
     });
@@ -65,7 +63,7 @@ class UTalkAPI {
   // Get user information and organization ID
   async getMe() {
     try {
-      const response = await this.client.get('/v1/members/me');
+      const response = await this.client.get('/v1/member/me');
       return response.data;
     } catch (error) {
       console.error('Failed to get user info:', error.message);
@@ -76,7 +74,7 @@ class UTalkAPI {
   // List all channels
   async getChannels() {
     try {
-      const response = await this.client.get('/channels');
+      const response = await this.client.get('/v1/channels');
       return response.data;
     } catch (error) {
       console.error('Failed to get channels:', error.message);
@@ -93,9 +91,8 @@ class UTalkAPI {
         cleanPhone = '+' + cleanPhone;
       }
       
-      const response = await this.client.post('/channels', {
+      const response = await this.client.post('/v1/channels/waba', {
         name: name,
-        type: 'whatsapp_business',
         phoneNumber: cleanPhone
       });
       return response.data;
@@ -108,10 +105,7 @@ class UTalkAPI {
   // Create a Starter channel (fallback option)
   async createStarterChannel(name) {
     try {
-      const response = await this.client.post('/channels', {
-        name: name,
-        type: 'whatsapp_cloud'
-      });
+      const response = await this.client.post('/v1/channels/starter', { name });
       return response.data;
     } catch (error) {
       console.error('Failed to create starter channel:', error.message);
@@ -144,11 +138,8 @@ class UTalkAPI {
         throw new Error('message is required');
       }
 
-      // Clean phone number and ensure it starts with "+"
-      let cleanPhone = phoneNumber.replace(/\D/g, '');
-      if (!cleanPhone.startsWith('+')) {
-        cleanPhone = '+' + cleanPhone;
-      }
+      // Clean phone number (API expects just digits with country code)
+      const cleanPhone = phoneNumber.replace(/\D/g, '');
       
       // Validate phone number format
       if (cleanPhone.length < 9 || cleanPhone.length > 16) {
@@ -156,18 +147,18 @@ class UTalkAPI {
       }
 
       const payload = {
-        channelId: channelId,
-        to: cleanPhone,
-        type: 'text',
-        content: {
-          text: message.trim()
-        }
+        ToPhone: cleanPhone,
+        FromPhone: process.env.BUSINESS_PHONE,
+        OrganizationId: organizationId,
+        Message: message.trim()
       };
 
       console.log('Sending message with payload:', payload);
       
-      // Use the correct endpoint for sending messages
-      const response = await this.client.post('/messages', payload);
+      // Simplified send endpoint per docs
+      const response = await this.client.post('/v1/messages/simplified/', payload, {
+        headers: { 'Content-Type': 'application/json' }
+      });
       return response.data;
     } catch (error) {
       if (error.response?.data) {
@@ -184,13 +175,13 @@ class UTalkAPI {
       // Clean phone number
       const cleanPhone = phoneNumber.replace(/\D/g, '');
       
-      const response = await this.client.post('/v1/template-messages/simplified', {
-        channelId: channelId,
-        organizationId: organizationId,
-        phoneNumber: cleanPhone,
-        templateName: templateName,
-        parameters: parameters
-      });
+      const response = await this.client.post('/v1/template-messages/simplified/', {
+        ToPhone: cleanPhone,
+        FromPhone: process.env.BUSINESS_PHONE,
+        OrganizationId: organizationId,
+        TemplateName: templateName,
+        Parameters: parameters
+      }, { headers: { 'Content-Type': 'application/json' } });
       return response.data;
     } catch (error) {
       console.error('Failed to send template message:', error.message);
@@ -232,6 +223,19 @@ class UTalkAPI {
     formattedMessage += `\n_Mensagem enviada automaticamente via UTalk Bot_`;
     
     return formattedMessage;
+  }
+
+  // Format organized customer notification message
+  formatOrganizedNotification({ clientName, attendantName, idleTime, link }) {
+    const lines = [];
+    lines.push('📩 *Notificação de Atendimento*');
+    if (clientName) lines.push(`👤 *Cliente:* ${clientName}`);
+    if (attendantName) lines.push(`🧑‍💼 *Atendente:* ${attendantName}`);
+    if (idleTime) lines.push(`⏱️ *Tempo sem resposta:* ${idleTime}`);
+    if (link) lines.push(`🔗 *Link:* ${link}`);
+    lines.push('');
+    lines.push('_Mensagem enviada automaticamente via UTalk Bot_');
+    return lines.join('\n');
   }
 }
 
