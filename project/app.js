@@ -7,13 +7,27 @@ const { getAttendantNameById } = require('./config/attendants');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const MANAGER_PHONE = process.env.MANAGER_PHONE; // digits only with country code
+const MANAGER_PHONES = (process.env.MANAGER_PHONES || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+const MANAGER_WEBHOOKS = (process.env.MANAGER_WEBHOOKS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 const MANAGER_ATTENDANT_ID = process.env.MANAGER_ATTENDANT_ID; // optional ID mapping
 const WEBHOOK_DEBUG = (process.env.WEBHOOK_DEBUG || 'true') === 'true';
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
 // Middleware
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
+function requireAdmin(req, res, next) {
+  const token = req.headers['x-admin-token'] || req.query.token;
+  if (ADMIN_TOKEN && token === ADMIN_TOKEN) return next();
+  return res.status(401).json({ success: false, error: 'Unauthorized' });
+}
 
 // Initialize API
 let api;
@@ -26,47 +40,130 @@ try {
 }
 
 // In-memory store for idle timers per conversation (e.g., by contact phone or conversation id)
-const idleTimers = new Map();
+// Conversation state (in-memory; for production, use persistent store)
+const conversations = new Map(); // key -> { lastInboundAt, lastOutboundAt, alertedAt, meta }
 const recentWebhookEvents = [];
 const MAX_RECENT_EVENTS = 200;
 const IDLE_MS = Number(process.env.IDLE_MS || 15 * 60 * 1000); // override via env
+const BUSINESS_START_HOUR = 9; // 09:00 local time
+const BUSINESS_END_HOUR = 17; // 17:00 local time (non-inclusive)
+const MAX_IDLE_ALERT_MINUTES = 60; // if >= 60 minutes de inatividade, não envia
 
-function scheduleIdleAlert(key, context) {
-  clearIdleAlert(key);
-  const timer = setTimeout(async () => {
-    try {
-      if (!MANAGER_PHONE) {
-        console.warn('Manager phone not configured; skipping idle alert');
-        return;
-      }
-      const organizationId = process.env.ORGANIZATION_ID;
-      const channelId = process.env.CHANNEL_ID;
-      const attendantName = getAttendantNameById(context.attendantId) || context.attendantName || 'Atendente';
-      const clientName = context.clientName || context.fromName || context.fromPhone;
-      const link = context.link || '';
-      const idleTime = '15 minutos';
-
-      const alertMessage = api.formatOrganizedNotification({
-        clientName,
-        attendantName,
-        idleTime,
-        link
-      });
-
-      console.log('Sending idle alert to manager:', { MANAGER_PHONE, clientName, attendantName });
-      await api.sendMessage(channelId, MANAGER_PHONE, alertMessage, organizationId);
-    } catch (err) {
-      console.error('Failed to send idle alert:', err.message);
-    }
-  }, IDLE_MS);
-  idleTimers.set(key, timer);
+function isBusinessDay(date) {
+  const d = new Date(date);
+  const day = d.getDay(); // 0=Sun, 6=Sat
+  return day >= 1 && day <= 5; // Mon-Fri
 }
 
-function clearIdleAlert(key) {
-  const t = idleTimers.get(key);
-  if (t) {
-    clearTimeout(t);
-    idleTimers.delete(key);
+function isWithinBusinessHours(date) {
+  const d = new Date(date);
+  const h = d.getHours();
+  return isBusinessDay(d) && h >= BUSINESS_START_HOUR && h < BUSINESS_END_HOUR;
+}
+
+function getBusinessWindowForDate(date) {
+  const d = new Date(date);
+  const start = new Date(d);
+  start.setHours(BUSINESS_START_HOUR, 0, 0, 0);
+  const end = new Date(d);
+  end.setHours(BUSINESS_END_HOUR, 0, 0, 0);
+  return { start, end };
+}
+
+function businessElapsedMs(startMs, endMs) {
+  if (!startMs || !endMs || endMs <= startMs) return 0;
+  let elapsed = 0;
+  let cursor = new Date(startMs);
+  const end = new Date(endMs);
+  // iterate by days
+  while (cursor < end) {
+    const { start, end: dayEnd } = getBusinessWindowForDate(cursor);
+    const dayStart = start;
+    const curEndOfWindow = dayEnd;
+    if (isBusinessDay(cursor)) {
+      const curStart = cursor > dayStart ? cursor : dayStart;
+      const curEnd = end < curEndOfWindow ? end : curEndOfWindow;
+      if (curEnd > curStart) {
+        elapsed += curEnd - curStart;
+      }
+    }
+    // move to next day 00:00
+    const nextDay = new Date(dayStart);
+    nextDay.setDate(nextDay.getDate() + 1);
+    cursor = nextDay;
+  }
+  return elapsed;
+}
+
+function stableHash(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) {
+    h = (h * 31 + str.charCodeAt(i)) | 0;
+  }
+  return Math.abs(h);
+}
+
+function selectManagerPhoneForKey(key) {
+  if (MANAGER_PHONES.length > 0) {
+    const idx = stableHash(key) % MANAGER_PHONES.length;
+    return MANAGER_PHONES[idx];
+  }
+  return MANAGER_PHONE;
+}
+
+function selectManagerWebhookForKey(key) {
+  if (MANAGER_WEBHOOKS.length > 0) {
+    const idx = stableHash(key) % MANAGER_WEBHOOKS.length;
+    return MANAGER_WEBHOOKS[idx];
+  }
+  return null;
+}
+
+async function maybeSendDueAlerts(now = Date.now()) {
+  const hasAnyManager = MANAGER_WEBHOOKS.length > 0 || MANAGER_PHONES.length > 0 || MANAGER_PHONE;
+  if (!hasAnyManager) return;
+  const organizationId = process.env.ORGANIZATION_ID;
+  const channelId = process.env.CHANNEL_ID;
+  for (const [key, state] of conversations.entries()) {
+    const { lastInboundAt, lastOutboundAt, alertedAt, meta } = state;
+    if (!lastInboundAt) continue;
+    const replied = lastOutboundAt && lastOutboundAt >= lastInboundAt;
+    const businessElapsed = businessElapsedMs(lastInboundAt, now);
+    const overdue = businessElapsed >= IDLE_MS;
+    const alreadyAlerted = Boolean(alertedAt) && alertedAt >= lastInboundAt;
+    const overCap = businessElapsed >= MAX_IDLE_ALERT_MINUTES * 60000; // >= 60 min úteis
+    const nowWithinHours = isWithinBusinessHours(now);
+    if (!replied && overdue && !overCap && !alreadyAlerted && nowWithinHours) {
+      const attendantName = getAttendantNameById(meta.attendantId) || meta.attendantName || 'Atendente';
+      const clientName = meta.clientName || meta.fromName || meta.fromPhone;
+      const link = meta.link || '';
+      const minutes = Math.round(businessElapsed / 60000);
+      const managerWebhook = selectManagerWebhookForKey(key);
+      const managerPhone = selectManagerPhoneForKey(key);
+      const alertMessage = api.formatOrganizedNotification({ clientName, attendantName, idleTime: `${minutes} minutos`, link });
+      try {
+        if (managerWebhook) {
+          console.log('Posting idle alert to manager webhook:', { key, managerWebhook, clientName, attendantName, minutes });
+          await require('axios').post(managerWebhook, {
+            type: 'idle-alert',
+            conversationId: key,
+            clientName,
+            attendantName,
+            idleMinutes: minutes,
+            link,
+            occurredAt: new Date(now).toISOString()
+          }, { headers: { 'Content-Type': 'application/json' } });
+        } else if (managerPhone) {
+          console.log('Sending idle alert to manager phone:', { key, managerPhone, clientName, attendantName, minutes });
+          await api.sendMessage(channelId, managerPhone, alertMessage, organizationId);
+        } else {
+          console.warn('No manager target configured for key:', key);
+        }
+        state.alertedAt = now;
+      } catch (e) {
+        console.error('Failed to send idle alert:', e.message);
+      }
+    }
   }
 }
 
@@ -120,13 +217,33 @@ app.post('/api/webhook/utalk', async (req, res) => {
   try {
     const event = req.body || {};
     // Normalize fields (UTalk payloads may vary)
-    const type = event.type || event.event || '';
-    const message = event.message || event.payload || {};
-    const conversationId = message.conversationId || message.chatId || message.ticketId || event.conversationId || null;
-    const fromPhone = (message.from && (message.from.phone || message.from.phoneNumber)) || message.fromPhone || message.contactPhone || event.fromPhone || null;
-    const fromName = (message.from && message.from.name) || message.contactName || event.fromName || null;
-    const attendantId = message.attendantId || message.agentId || event.assignedTo || event.attendantId || null;
-    const direction = message.direction || event.direction || (type.includes('in') ? 'in' : type.includes('out') ? 'out' : '');
+    const type = event.type || event.Type || event.event || '';
+    let message = event.message || event.Message || event.payload || event.Payload || {};
+
+    // Default normalized fields
+    let conversationId = message.conversationId || message.chatId || message.ticketId || event.conversationId || null;
+    let fromPhone = (message.from && (message.from.phone || message.from.phoneNumber)) || message.fromPhone || message.contactPhone || event.fromPhone || null;
+    let fromName = (message.from && message.from.name) || message.contactName || event.fromName || null;
+    let attendantId = message.attendantId || message.agentId || event.assignedTo || event.attendantId || null;
+    let direction = message.direction || event.direction || (typeof type === 'string' ? (type.includes('in') ? 'in' : type.includes('out') ? 'out' : '') : '');
+
+    // Handle Chat snapshot style (Payload.Type === 'Chat')
+    const payloadType = (event.Payload && event.Payload.Type) || (event.payload && event.payload.Type) || null;
+    const content = (event.Payload && event.Payload.Content) || (event.payload && event.payload.Content) || null;
+    if (payloadType === 'Chat' && content) {
+      const lastMessage = content.LastMessage || {};
+      conversationId = (lastMessage.Chat && lastMessage.Chat.Id) || content.Id || conversationId;
+      fromPhone = (content.Contact && content.Contact.PhoneNumber) || fromPhone;
+      fromName = (content.Contact && content.Contact.Name) || fromName;
+      attendantId = (lastMessage.SentByOrganizationMember && lastMessage.SentByOrganizationMember.Id) || attendantId;
+      const src = lastMessage.Source || null; // 'Member' for attendant, 'Contact' for client
+      if (!direction) {
+        if (src === 'Member' || attendantId) direction = 'out';
+        else if (src === 'Contact') direction = 'in';
+      }
+      // For observability
+      message = { ...message, conversationId, contactPhone: fromPhone, contactName: fromName };
+    }
 
     // Build link using conversationId when available
     const conversationLink = conversationId ? `https://app-utalk.umbler.com/chats/${conversationId}` : null;
@@ -150,24 +267,20 @@ app.post('/api/webhook/utalk', async (req, res) => {
       console.log('Webhook received:', { type, direction, conversationId, fromPhone, attendantId });
     }
 
-    // Only schedule idle alert on inbound messages from client
-    // If two attendants are talking (both outbound), this will not schedule
-    if (direction === 'in') {
-      if (key) {
-        scheduleIdleAlert(key, {
-          attendantId,
-          attendantName: getAttendantNameById(attendantId),
-          clientName: fromName,
-          fromPhone,
-          fromName,
-          link: conversationLink
-        });
+    // Update conversation state; do NOT send here to avoid per-webhook sends
+    if (key) {
+      const now = Date.now();
+      const state = conversations.get(key) || { lastInboundAt: null, lastOutboundAt: null, alertedAt: null, meta: {} };
+      if (direction === 'in') {
+        state.lastInboundAt = now;
+        // reset alert marker on new inbound
+        state.alertedAt = null;
+        state.meta = { attendantId, fromPhone, fromName, clientName: fromName, link: conversationLink };
+      } else if (direction === 'out') {
+        state.lastOutboundAt = now;
+        // allow future alerts after new inbound
       }
-    }
-
-    // On any outbound (attendant response), clear the timer for that conversation
-    if (direction === 'out') {
-      if (key) clearIdleAlert(key);
+      conversations.set(key, state);
     }
 
     // Acknowledge quickly
@@ -179,18 +292,50 @@ app.post('/api/webhook/utalk', async (req, res) => {
 });
 
 // Debug endpoint to verify webhook arrivals and internal state
-app.get('/api/webhook/utalk/debug', (req, res) => {
+app.get('/api/webhook/utalk/debug', requireAdmin, (req, res) => {
   try {
-    const activeTimers = Array.from(idleTimers.keys());
+    const states = Array.from(conversations.entries()).map(([key, s]) => ({ key, lastInboundAt: s.lastInboundAt, lastOutboundAt: s.lastOutboundAt, alertedAt: s.alertedAt }));
     res.json({
       success: true,
-      activeTimers,
+      conversations: states,
       idleMs: IDLE_MS,
+      businessHours: { startHour: BUSINESS_START_HOUR, endHour: BUSINESS_END_HOUR },
+      managerPhones: MANAGER_PHONES.length ? MANAGER_PHONES : (MANAGER_PHONE ? [MANAGER_PHONE] : []),
+      managerWebhooks: MANAGER_WEBHOOKS,
       recentCount: recentWebhookEvents.length,
       recentSample: recentWebhookEvents.slice(0, 20)
     });
   } catch (e) {
     res.json({ success: false, error: e.message });
+  }
+});
+
+// Cron/sweep endpoint to evaluate due alerts
+app.post('/api/webhook/utalk/sweep', requireAdmin, async (req, res) => {
+  try {
+    await maybeSendDueAlerts(Date.now());
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Manual test endpoint to send an immediate alert to manager
+app.post('/api/test/send-manager-alert', async (req, res) => {
+  try {
+    if (!MANAGER_PHONE) {
+      return res.status(400).json({ success: false, error: 'MANAGER_PHONE is not configured' });
+    }
+    const organizationId = process.env.ORGANIZATION_ID;
+    const channelId = process.env.CHANNEL_ID;
+    const { clientName = 'Cliente Teste', attendantId = MANAGER_ATTENDANT_ID, conversationId = 'TEST_CONV_MANUAL' } = req.body || {};
+    const attendantName = getAttendantNameById(attendantId) || 'Atendente';
+    const link = `https://app-utalk.umbler.com/chats/${conversationId}`;
+    const alertMessage = api.formatOrganizedNotification({ clientName, attendantName, idleTime: '15 minutos', link });
+    const result = await api.sendMessage(channelId, MANAGER_PHONE, alertMessage, organizationId);
+    res.json({ success: true, data: result, sentMessage: alertMessage });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
   }
 });
 

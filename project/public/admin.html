@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Admin - UTalk Notificações</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; background: #f5f6f8; margin: 0; }
+    .container { max-width: 1000px; margin: 0 auto; padding: 24px; }
+    .card { background: #fff; border: 1px solid #e9ecef; border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+    .row { display: flex; gap: 12px; align-items: center; }
+    .row > * { flex: 1; }
+    input, button { padding: 10px 12px; border-radius: 8px; border: 1px solid #ced4da; font-size: 14px; }
+    button { background: #25D366; color: #fff; border: none; cursor: pointer; }
+    button.secondary { background: #6c757d; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #e9ecef; font-size: 14px; }
+    h1 { margin: 0 0 16px 0; font-size: 20px; }
+    .muted { color: #6c757d; }
+    .small { font-size: 12px; }
+    .ok { color: #28a745; }
+    .warn { color: #ffc107; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Admin - UTalk Notificações</h1>
+    <div class="card">
+      <div class="row">
+        <input id="token" type="password" placeholder="X-Admin-Token" />
+        <button id="load">Carregar Status</button>
+        <button id="sweep" class="secondary">Executar Sweep</button>
+      </div>
+      <div class="small muted" style="margin-top:8px;">O token é necessário para acessar as rotas administrativas.</div>
+    </div>
+
+    <div class="card" id="status">
+      <div class="row">
+        <div>
+          <div class="muted small">Idle (ms)</div>
+          <div id="idleMs">-</div>
+        </div>
+        <div>
+          <div class="muted small">Horário Comercial</div>
+          <div id="biz">-</div>
+        </div>
+        <div>
+          <div class="muted small">Gestoras</div>
+          <div id="managers">-</div>
+        </div>
+        <div>
+          <div class="muted small">Eventos Recentes</div>
+          <div id="recent">-</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-top:0">Conversas Monitoradas</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Key</th>
+            <th>Last Inbound</th>
+            <th>Last Outbound</th>
+            <th>Alerted At</th>
+          </tr>
+        </thead>
+        <tbody id="conversations"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    async function fetchJSON(path, token) {
+      const res = await fetch(path, { headers: { 'X-Admin-Token': token } });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    }
+
+    function fmt(ts) {
+      if (!ts) return '-';
+      const d = new Date(ts);
+      if (isNaN(d.getTime())) return '-';
+      return d.toLocaleString();
+    }
+
+    document.getElementById('load').addEventListener('click', async () => {
+      const token = document.getElementById('token').value.trim();
+      try {
+        const data = await fetchJSON('/api/webhook/utalk/debug', token);
+        document.getElementById('idleMs').textContent = data.idleMs;
+        document.getElementById('biz').textContent = `${data.businessHours.startHour}:00–${data.businessHours.endHour}:00 (Mon–Fri)`;
+        document.getElementById('managers').textContent = (data.managerPhones || []).join(', ') || '-';
+        document.getElementById('recent').textContent = data.recentCount;
+        const tb = document.getElementById('conversations');
+        tb.innerHTML = '';
+        (data.conversations || []).forEach(c => {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td>${c.key}</td><td>${fmt(c.lastInboundAt)}</td><td>${fmt(c.lastOutboundAt)}</td><td>${fmt(c.alertedAt)}</td>`;
+          tb.appendChild(tr);
+        });
+      } catch (e) {
+        alert('Erro: ' + e.message);
+      }
+    });
+
+    document.getElementById('sweep').addEventListener('click', async () => {
+      const token = document.getElementById('token').value.trim();
+      try {
+        const res = await fetch('/api/webhook/utalk/sweep', { method: 'POST', headers: { 'X-Admin-Token': token } });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        alert('Sweep executado. Verifique se houve alertas.');
+      } catch (e) {
+        alert('Erro: ' + e.message);
+      }
+    });
+  </script>
+</body>
+</html>
+
+

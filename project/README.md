@@ -215,7 +215,17 @@ MANAGER_PHONE=5511999999999
 MANAGER_ATTENDANT_ID=aGevxChnIrrCytFy
 IDLE_MS=600000
 WEBHOOK_DEBUG=true
+MANAGER_PHONES=5511999999991,5511999999992,5511999999993
+ADMIN_TOKEN=coloque_um_token_secreto
 ## 🚇 Testes locais com ngrok e simulador
+## 🔐 Admin Dashboard
+
+- Acesse `http://SEU_HOST/admin.html`
+- Informe o header `X-Admin-Token` (campo no topo) com `ADMIN_TOKEN`
+- Funções:
+  - Carregar status (conversas monitoradas, idleMs, horário comercial, gestoras)
+  - Executar Sweep (dispara cálculo e alertas devidos)
+
 
 1. Inicie o servidor local:
 ```

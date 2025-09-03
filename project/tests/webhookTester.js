@@ -42,6 +42,39 @@ function makeOutbound({ conversationId, attendantId, text = 'Olá, posso ajudar.
   };
 }
 
+function makeChatSnapshot({ conversationId, contactPhone, contactName, memberId, source = 'Contact', messageType = 'Text' }) {
+  return {
+    Type: 'Message',
+    EventDate: new Date().toISOString(),
+    Payload: {
+      Type: 'Chat',
+      Content: {
+        _t: 'BasicChatModel',
+        Organization: { Id: 'ORG_TEST' },
+        Contact: {
+          PhoneNumber: contactPhone,
+          Name: contactName,
+          Id: 'CONTACT_TEST'
+        },
+        Channel: { Id: 'CHANNEL_TEST', PhoneNumber: '+5511999999999', Name: 'Test' },
+        OrganizationMember: { Id: memberId || null },
+        OrganizationMembers: [],
+        LastMessage: {
+          MessageType: messageType,
+          SentByOrganizationMember: source === 'Member' ? { Id: memberId } : null,
+          Source: source,
+          EventAtUTC: new Date().toISOString(),
+          Chat: { Id: conversationId },
+          Id: 'MSG_TEST'
+        },
+        Id: conversationId,
+        CreatedAtUTC: new Date().toISOString()
+      }
+    },
+    EventId: 'EVT_TEST'
+  };
+}
+
 async function main() {
   const argv = yargs(hideBin(process.argv))
     .option('baseUrl', { type: 'string', demandOption: true, desc: 'Base URL, e.g., https://<ngrok>.ngrok.io' })
@@ -71,24 +104,24 @@ async function main() {
   if (argv.scenario === 'idle') {
     // Inbound, wait (expect manager alert from server after IDLE_MS)
     console.log('Sending inbound (client message) ...');
-    await post(argv.baseUrl, '/api/webhook/utalk', makeInbound(argv));
+    await post(argv.baseUrl, '/api/webhook/utalk', makeChatSnapshot({ conversationId: argv.conversationId, contactPhone: argv.fromPhone, contactName: argv.fromName, source: 'Contact' }));
     console.log('Await idle period on server...');
   }
 
   if (argv.scenario === 'reply') {
     // Inbound, then outbound (should cancel timer)
     console.log('Sending inbound (client message) ...');
-    await post(argv.baseUrl, '/api/webhook/utalk', makeInbound(argv));
+    await post(argv.baseUrl, '/api/webhook/utalk', makeChatSnapshot({ conversationId: argv.conversationId, contactPhone: argv.fromPhone, contactName: argv.fromName, source: 'Contact' }));
     console.log('Sending outbound (attendant reply) ...');
-    await post(argv.baseUrl, '/api/webhook/utalk', makeOutbound(argv));
+    await post(argv.baseUrl, '/api/webhook/utalk', makeChatSnapshot({ conversationId: argv.conversationId, contactPhone: argv.fromPhone, contactName: argv.fromName, source: 'Member', memberId: argv.attendantId }));
   }
 
   if (argv.scenario === 'multi-attendants') {
     // Only outbound from multiple attendants (should not schedule timer)
     console.log('Sending outbound from attendant A ...');
-    await post(argv.baseUrl, '/api/webhook/utalk', makeOutbound({ ...argv, attendantId: argv.attendantId, text: 'Atendente A respondendo' }));
+    await post(argv.baseUrl, '/api/webhook/utalk', makeChatSnapshot({ conversationId: argv.conversationId, contactPhone: argv.fromPhone, contactName: argv.fromName, source: 'Member', memberId: argv.attendantId }));
     console.log('Sending outbound from attendant B ...');
-    await post(argv.baseUrl, '/api/webhook/utalk', makeOutbound({ ...argv, attendantId: 'ZUqcbp8LSKZvEHKO', text: 'Atendente B respondendo' }));
+    await post(argv.baseUrl, '/api/webhook/utalk', makeChatSnapshot({ conversationId: argv.conversationId, contactPhone: argv.fromPhone, contactName: argv.fromName, source: 'Member', memberId: 'ZUqcbp8LSKZvEHKO' }));
   }
 
   await sleep(1000);
