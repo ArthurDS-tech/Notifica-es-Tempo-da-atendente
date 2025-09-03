@@ -29,7 +29,7 @@ try {
 const idleTimers = new Map();
 const recentWebhookEvents = [];
 const MAX_RECENT_EVENTS = 200;
-const IDLE_MS = 15 * 60 * 1000; // 15 minutes
+const IDLE_MS = Number(process.env.IDLE_MS || 15 * 60 * 1000); // override via env
 
 function scheduleIdleAlert(key, context) {
   clearIdleAlert(key);
@@ -185,6 +185,7 @@ app.get('/api/webhook/utalk/debug', (req, res) => {
     res.json({
       success: true,
       activeTimers,
+      idleMs: IDLE_MS,
       recentCount: recentWebhookEvents.length,
       recentSample: recentWebhookEvents.slice(0, 20)
     });

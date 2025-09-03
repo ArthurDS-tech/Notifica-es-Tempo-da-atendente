@@ -6,7 +6,11 @@
   "scripts": {
     "start": "node app.js",
     "test": "node sendMessage.js",
-    "setup": "node setup.js"
+    "setup": "node setup.js",
+    "dev:ngrok": "echo Set your ngrok tunnel and use the printed URL",
+    "test:webhook:idle": "node tests/webhookTester.js --scenario idle --baseUrl %BASE_URL%",
+    "test:webhook:reply": "node tests/webhookTester.js --scenario reply --baseUrl %BASE_URL%",
+    "test:webhook:multi": "node tests/webhookTester.js --scenario multi-attendants --baseUrl %BASE_URL%"
   },
   "dependencies": {
     "axios": "^1.6.0",

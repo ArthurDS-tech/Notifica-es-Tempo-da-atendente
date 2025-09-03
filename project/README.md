@@ -213,6 +213,40 @@ Adicione ao seu `.env`:
 ```
 MANAGER_PHONE=5511999999999
 MANAGER_ATTENDANT_ID=aGevxChnIrrCytFy
+IDLE_MS=600000
+WEBHOOK_DEBUG=true
+## 🚇 Testes locais com ngrok e simulador
+
+1. Inicie o servidor local:
+```
+npm start
+```
+
+2. Inicie o ngrok (HTTP na porta do app, ex.: 3000):
+```
+ngrok http 3000
+```
+Copie a URL pública gerada (ex.: https://example.ngrok.io).
+
+3. Configure o webhook do UTalk para apontar para:
+```
+https://example.ngrok.io/api/webhook/utalk
+```
+
+4. Simule cenários com o tester:
+```
+set BASE_URL=https://example.ngrok.io
+npm run test:webhook:idle
+npm run test:webhook:reply
+npm run test:webhook:multi
+```
+
+5. Inspecione o estado do servidor:
+```
+GET https://example.ngrok.io/api/webhook/utalk/debug
+```
+Retorno contém `activeTimers`, `idleMs` e amostra dos últimos eventos.
+
 ```
 
 - `MANAGER_PHONE`: telefone fixo (c/ DDI) que receberá alertas
