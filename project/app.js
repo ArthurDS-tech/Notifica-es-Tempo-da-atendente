@@ -8,6 +8,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const MANAGER_PHONE = process.env.MANAGER_PHONE; // digits only with country code
 const MANAGER_ATTENDANT_ID = process.env.MANAGER_ATTENDANT_ID; // optional ID mapping
+const WEBHOOK_DEBUG = (process.env.WEBHOOK_DEBUG || 'true') === 'true';
 
 // Middleware
 app.use(bodyParser.json());
@@ -26,6 +27,8 @@ try {
 
 // In-memory store for idle timers per conversation (e.g., by contact phone or conversation id)
 const idleTimers = new Map();
+const recentWebhookEvents = [];
+const MAX_RECENT_EVENTS = 200;
 const IDLE_MS = 15 * 60 * 1000; // 15 minutes
 
 function scheduleIdleAlert(key, context) {
@@ -116,30 +119,55 @@ app.get('/api/channel-status/:channelId', async (req, res) => {
 app.post('/api/webhook/utalk', async (req, res) => {
   try {
     const event = req.body || {};
-    // Common fields we may receive (structure may vary by UTalk)
+    // Normalize fields (UTalk payloads may vary)
     const type = event.type || event.event || '';
     const message = event.message || event.payload || {};
-    const conversationId = message.conversationId || message.chatId || message.ticketId || null;
-    const fromPhone = (message.from && message.from.phone) || message.fromPhone || message.contactPhone || null;
-    const fromName = (message.from && message.from.name) || message.contactName || null;
-    const attendantId = message.attendantId || message.agentId || event.assignedTo || null;
-    const link = message.link || message.conversationLink || null;
+    const conversationId = message.conversationId || message.chatId || message.ticketId || event.conversationId || null;
+    const fromPhone = (message.from && (message.from.phone || message.from.phoneNumber)) || message.fromPhone || message.contactPhone || event.fromPhone || null;
+    const fromName = (message.from && message.from.name) || message.contactName || event.fromName || null;
+    const attendantId = message.attendantId || message.agentId || event.assignedTo || event.attendantId || null;
+    const direction = message.direction || event.direction || (type.includes('in') ? 'in' : type.includes('out') ? 'out' : '');
+
+    // Build link using conversationId when available
+    const conversationLink = conversationId ? `https://app-utalk.umbler.com/chats/${conversationId}` : null;
 
     // Build a key to track idle by conversation (fallback to phone)
     const key = conversationId || fromPhone;
 
-    // When we get an inbound message from client, schedule idle alert
-    if (event.direction === 'in' || message.direction === 'in' || type === 'message-in') {
+    // Record for debug/observability
+    if (WEBHOOK_DEBUG) {
+      recentWebhookEvents.unshift({
+        ts: new Date().toISOString(),
+        type,
+        direction,
+        conversationId,
+        fromPhone,
+        fromName,
+        attendantId,
+        attendantName: getAttendantNameById(attendantId) || null
+      });
+      if (recentWebhookEvents.length > MAX_RECENT_EVENTS) recentWebhookEvents.pop();
+      console.log('Webhook received:', { type, direction, conversationId, fromPhone, attendantId });
+    }
+
+    // Only schedule idle alert on inbound messages from client
+    // If two attendants are talking (both outbound), this will not schedule
+    if (direction === 'in') {
       if (key) {
-        scheduleIdleAlert(key, { attendantId, attendantName: getAttendantNameById(attendantId), clientName: fromName, fromPhone, fromName, link });
+        scheduleIdleAlert(key, {
+          attendantId,
+          attendantName: getAttendantNameById(attendantId),
+          clientName: fromName,
+          fromPhone,
+          fromName,
+          link: conversationLink
+        });
       }
     }
 
-    // When outbound message (attendant replied), clear idle timer
-    if (event.direction === 'out' || message.direction === 'out' || type === 'message-out') {
-      if (key) {
-        clearIdleAlert(key);
-      }
+    // On any outbound (attendant response), clear the timer for that conversation
+    if (direction === 'out') {
+      if (key) clearIdleAlert(key);
     }
 
     // Acknowledge quickly
@@ -147,6 +175,21 @@ app.post('/api/webhook/utalk', async (req, res) => {
   } catch (error) {
     console.error('Webhook handling error:', error);
     res.status(200).json({ ok: true });
+  }
+});
+
+// Debug endpoint to verify webhook arrivals and internal state
+app.get('/api/webhook/utalk/debug', (req, res) => {
+  try {
+    const activeTimers = Array.from(idleTimers.keys());
+    res.json({
+      success: true,
+      activeTimers,
+      recentCount: recentWebhookEvents.length,
+      recentSample: recentWebhookEvents.slice(0, 20)
+    });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
   }
 });
 
