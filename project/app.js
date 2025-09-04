@@ -79,6 +79,7 @@ try {
 // Conversation state (in-memory; for production, use persistent store)
 const conversations = new Map(); // key -> { lastInboundAt, lastOutboundAt, alertedAt, meta }
 const recentWebhookEvents = [];
+const recentWebhookSkips = [];
 const MAX_RECENT_EVENTS = 200;
 const IDLE_MS = Number(process.env.IDLE_MS || 15 * 60 * 1000); // override via env
 const BUSINESS_START_HOUR = 9; // 09:00 local time
@@ -316,7 +317,7 @@ app.post('/api/webhook/utalk', async (req, res) => {
     if (payloadType === 'Chat' && content) {
       const lastMessage = content.LastMessage || {};
       conversationId = (lastMessage.Chat && lastMessage.Chat.Id) || content.Id || conversationId;
-      fromPhone = (content.Contact && content.Contact.PhoneNumber) || fromPhone;
+      fromPhone = (content.Contact && (content.Contact.PhoneNumber || content.Contact.Phone)) || fromPhone;
       fromName = (content.Contact && content.Contact.Name) || fromName;
       attendantId = (lastMessage.SentByOrganizationMember && lastMessage.SentByOrganizationMember.Id) || attendantId;
       const src = lastMessage.Source || null; // 'Member' for attendant, 'Contact' for client
@@ -328,11 +329,20 @@ app.post('/api/webhook/utalk', async (req, res) => {
       message = { ...message, conversationId, contactPhone: fromPhone, contactName: fromName };
     }
 
+    // Normalize phone to digits if present
+    if (fromPhone) {
+      fromPhone = String(fromPhone).replace(/\D/g, '');
+      if (fromPhone.length === 0) fromPhone = null;
+    }
+
     // Build link using conversationId when available
     const conversationLink = conversationId ? `https://app-utalk.umbler.com/chats/${conversationId}` : null;
 
-    // Build a key to track idle by conversation (fallback to phone)
-    const key = conversationId || fromPhone;
+    // Build a key to track idle by conversation (fallbacks)
+    const contactId = (event.Payload && event.Payload.Content && event.Payload.Content.Contact && event.Payload.Content.Contact.Id)
+      || (event.payload && event.payload.Content && event.payload.Content.Contact && event.payload.Content.Contact.Id)
+      || null;
+    const key = conversationId || fromPhone || contactId;
 
     // Extract sector for routing
     const sector = extractSectorFromEvent(event, message);
@@ -355,7 +365,7 @@ app.post('/api/webhook/utalk', async (req, res) => {
     }
 
     // Update conversation state; do NOT send here to avoid per-webhook sends
-    if (key) {
+    if (key && direction) {
       const now = Date.now();
       const state = conversations.get(key) || { lastInboundAt: null, lastOutboundAt: null, alertedAt: null, meta: {} };
       if (direction === 'in') {
@@ -368,6 +378,11 @@ app.post('/api/webhook/utalk', async (req, res) => {
         // allow future alerts after new inbound
       }
       conversations.set(key, state);
+    } else {
+      // Record skip reason for debug
+      const reason = !key ? 'missing_key' : !direction ? 'missing_direction' : 'unknown';
+      recentWebhookSkips.unshift({ ts: new Date().toISOString(), reason, conversationId, fromPhone, type, payloadType });
+      if (recentWebhookSkips.length > MAX_RECENT_EVENTS) recentWebhookSkips.pop();
     }
 
     // Acknowledge quickly
@@ -393,7 +408,8 @@ app.get('/api/webhook/utalk/debug', requireAdmin, (req, res) => {
       managersConfigured: Object.fromEntries(Object.entries(MANAGERS).map(([k, v]) => [k, { hasWebhook: Boolean(v.webhook), hasPhone: Boolean(v.phone) } ])),
       stats: alertStats,
       recentCount: recentWebhookEvents.length,
-      recentSample: recentWebhookEvents.slice(0, 20)
+      recentSample: recentWebhookEvents.slice(0, 20),
+      recentSkips: recentWebhookSkips.slice(0, 20)
     });
   } catch (e) {
     res.json({ success: false, error: e.message });
