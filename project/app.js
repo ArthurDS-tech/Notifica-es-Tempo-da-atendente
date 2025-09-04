@@ -19,6 +19,42 @@ const MANAGER_ATTENDANT_ID = process.env.MANAGER_ATTENDANT_ID; // optional ID ma
 const WEBHOOK_DEBUG = (process.env.WEBHOOK_DEBUG || 'true') === 'true';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
+// Sector-based routing configuration
+// Define manager configs (name keys are arbitrary but must match mapping values)
+const MANAGERS = {
+  PAOLA: {
+    id: process.env.MANAGER1_ID || 'ZUpCF58LSKZvBvJr',
+    phone: (process.env.MANAGER1_PHONE || '+55 48 98811-2957').replace(/\D/g, ''),
+    webhook: process.env.MANAGER1_WEBHOOK || ''
+  },
+  MICHELE: {
+    id: process.env.MANAGER2_ID || 'ZZRSipl_JmIQx5qg',
+    phone: (process.env.MANAGER2_PHONE || '+55 48 99622-2357').replace(/\D/g, ''),
+    webhook: process.env.MANAGER2_WEBHOOK || ''
+  },
+  G3: {
+    id: process.env.MANAGER3_ID || '',
+    phone: (process.env.MANAGER3_PHONE || '').replace(/\D/g, ''),
+    webhook: process.env.MANAGER3_WEBHOOK || ''
+  }
+};
+
+// Map sectors to manager keys. Accepts JSON or ";" separated pairs Sector=MANAGERKEY
+function parseSectorManagerMap(raw) {
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    const map = {};
+    String(raw).split(';').map(s => s.trim()).filter(Boolean).forEach(pair => {
+      const [sector, managerKey] = pair.split('=').map(x => x && x.trim());
+      if (sector && managerKey) map[sector] = managerKey.toUpperCase();
+    });
+    return map;
+  }
+}
+const SECTOR_MANAGER_MAP = parseSectorManagerMap(process.env.SECTOR_MANAGER_MAP || '');
+
 // Middleware
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
@@ -119,6 +155,31 @@ function selectManagerWebhookForKey(key) {
   return null;
 }
 
+function selectManagerBySector(sector) {
+  const managerKey = (SECTOR_MANAGER_MAP[sector] || '').toUpperCase();
+  if (managerKey && MANAGERS[managerKey]) {
+    const m = MANAGERS[managerKey];
+    return { managerKey, webhook: m.webhook || null, phone: m.phone || null };
+  }
+  return null;
+}
+
+function extractSectorFromEvent(event, message) {
+  // Try common fields that might carry department/sector info
+  const tryValues = [
+    event.sector, event.Sector,
+    event.department, event.Department,
+    event.queue, event.Queue,
+    event.tag, event.Tag,
+    event.team, event.Team,
+    (event.Payload && (event.Payload.Sector || event.Payload.Department || event.Payload.Queue || event.Payload.Tag || event.Payload.Team)),
+    (event.payload && (event.payload.Sector || event.payload.Department || event.payload.Queue || event.payload.Tag || event.payload.Team)),
+    message && (message.sector || message.department || message.queue || message.tag || message.team)
+  ].filter(Boolean);
+  if (tryValues.length > 0) return String(tryValues[0]).trim();
+  return 'Geral';
+}
+
 // Stats for admin
 const alertStats = {
   totalAlertsSent: 0,
@@ -154,12 +215,15 @@ async function maybeSendDueAlerts(now = Date.now()) {
       const clientName = meta.clientName || meta.fromName || meta.fromPhone;
       const link = meta.link || '';
       const minutes = Math.round(businessElapsed / 60000);
-      const managerWebhook = selectManagerWebhookForKey(key);
-      const managerPhone = selectManagerPhoneForKey(key);
+      // Prefer sector-based routing if sector is known
+      const sector = meta.sector || 'Geral';
+      const sectorTarget = selectManagerBySector(sector);
+      const managerWebhook = (sectorTarget && sectorTarget.webhook) || selectManagerWebhookForKey(key);
+      const managerPhone = (sectorTarget && sectorTarget.phone) || selectManagerPhoneForKey(key);
       const alertMessage = api.formatOrganizedNotification({ clientName, attendantName, idleTime: `${minutes} minutos`, link });
       try {
         if (managerWebhook) {
-          console.log('Posting idle alert to manager webhook:', { key, managerWebhook, clientName, attendantName, minutes });
+          console.log('Posting idle alert to manager webhook:', { key, sector, managerWebhook, clientName, attendantName, minutes });
           await require('axios').post(managerWebhook, {
             type: 'idle-alert',
             conversationId: key,
@@ -167,11 +231,12 @@ async function maybeSendDueAlerts(now = Date.now()) {
             attendantName,
             idleMinutes: minutes,
             link,
+            sector,
             occurredAt: new Date(now).toISOString()
           }, { headers: { 'Content-Type': 'application/json' } });
           recordAlertStat(managerWebhook, now);
         } else if (managerPhone) {
-          console.log('Sending idle alert to manager phone:', { key, managerPhone, clientName, attendantName, minutes });
+          console.log('Sending idle alert to manager phone:', { key, sector, managerPhone, clientName, attendantName, minutes });
           await api.sendMessage(channelId, managerPhone, alertMessage, organizationId);
           recordAlertStat(managerPhone, now);
         } else {
@@ -269,6 +334,9 @@ app.post('/api/webhook/utalk', async (req, res) => {
     // Build a key to track idle by conversation (fallback to phone)
     const key = conversationId || fromPhone;
 
+    // Extract sector for routing
+    const sector = extractSectorFromEvent(event, message);
+
     // Record for debug/observability
     if (WEBHOOK_DEBUG) {
       recentWebhookEvents.unshift({
@@ -279,7 +347,8 @@ app.post('/api/webhook/utalk', async (req, res) => {
         fromPhone,
         fromName,
         attendantId,
-        attendantName: getAttendantNameById(attendantId) || null
+        attendantName: getAttendantNameById(attendantId) || null,
+        sector
       });
       if (recentWebhookEvents.length > MAX_RECENT_EVENTS) recentWebhookEvents.pop();
       console.log('Webhook received:', { type, direction, conversationId, fromPhone, attendantId });
@@ -293,7 +362,7 @@ app.post('/api/webhook/utalk', async (req, res) => {
         state.lastInboundAt = now;
         // reset alert marker on new inbound
         state.alertedAt = null;
-        state.meta = { attendantId, fromPhone, fromName, clientName: fromName, link: conversationLink };
+        state.meta = { attendantId, fromPhone, fromName, clientName: fromName, link: conversationLink, sector };
       } else if (direction === 'out') {
         state.lastOutboundAt = now;
         // allow future alerts after new inbound
@@ -312,7 +381,7 @@ app.post('/api/webhook/utalk', async (req, res) => {
 // Debug endpoint to verify webhook arrivals and internal state
 app.get('/api/webhook/utalk/debug', requireAdmin, (req, res) => {
   try {
-    const states = Array.from(conversations.entries()).map(([key, s]) => ({ key, lastInboundAt: s.lastInboundAt, lastOutboundAt: s.lastOutboundAt, alertedAt: s.alertedAt }));
+    const states = Array.from(conversations.entries()).map(([key, s]) => ({ key, lastInboundAt: s.lastInboundAt, lastOutboundAt: s.lastOutboundAt, alertedAt: s.alertedAt, sector: s.meta && s.meta.sector }));
     res.json({
       success: true,
       conversations: states,
@@ -320,6 +389,8 @@ app.get('/api/webhook/utalk/debug', requireAdmin, (req, res) => {
       businessHours: { startHour: BUSINESS_START_HOUR, endHour: BUSINESS_END_HOUR },
       managerPhones: MANAGER_PHONES.length ? MANAGER_PHONES : (MANAGER_PHONE ? [MANAGER_PHONE] : []),
       managerWebhooks: MANAGER_WEBHOOKS,
+      sectorManagerMap: SECTOR_MANAGER_MAP,
+      managersConfigured: Object.fromEntries(Object.entries(MANAGERS).map(([k, v]) => [k, { hasWebhook: Boolean(v.webhook), hasPhone: Boolean(v.phone) } ])),
       stats: alertStats,
       recentCount: recentWebhookEvents.length,
       recentSample: recentWebhookEvents.slice(0, 20)

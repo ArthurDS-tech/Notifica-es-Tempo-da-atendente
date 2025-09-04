@@ -318,3 +318,62 @@ For this bot implementation:
 **Happy messaging! 📱✨**
 
 Remember to always follow WhatsApp's terms of service and respect your recipients' privacy.
+
+## 🗂️ Setorização e Gestoras (Paola, Michele, Gestora 3)
+
+Este projeto suporta roteamento de alertas por setor para diferentes gestoras, com 3 webhooks distintos (um por gestora) e fallback por telefone.
+
+Setores esperados (exemplos): `Geral`, `Florianópolis`, `São José`, `Palhoça`, `lojas`, `Gestora`.
+
+### Como funciona
+
+- O servidor extrai o setor do objeto do webhook quando disponível. Se não vier, assume `Geral`.
+- Com base no setor, escolhe a gestora mapeada e envia o alerta:
+  - Preferência: `MANAGERx_WEBHOOK` (envio via HTTP POST)
+  - Fallback: `MANAGERx_PHONE` (envio via API UTalk/WhatsApp)
+  - Se ambos ausentes, usa fallbacks globais (`MANAGER_WEBHOOKS`, `MANAGER_PHONES`, `MANAGER_PHONE`).
+
+### Variáveis de ambiente
+
+Adicione ao `.env` as gestoras e o mapeamento de setores:
+
+```env
+# Organização (exemplo real informado)
+ORGANIZATION_ID=ZQG4wFMHGHuTs59F
+
+# Horário comercial e debug
+IDLE_MS=900000
+WEBHOOK_DEBUG=true
+ADMIN_TOKEN=coloque_um_token_secreto
+
+# Fallbacks (opcionais)
+MANAGER_PHONE=
+MANAGER_PHONES=
+MANAGER_WEBHOOKS=
+
+# Gestora 1 - Paola
+MANAGER1_ID=ZUpCF58LSKZvBvJr
+MANAGER1_PHONE=+55 48 98811-2957
+MANAGER1_WEBHOOK=https://seu-webhook-paola
+
+# Gestora 2 - Michele
+MANAGER2_ID=ZZRSipl_JmIQx5qg
+MANAGER2_PHONE=+55 48 99622-2357
+MANAGER2_WEBHOOK=https://seu-webhook-michele
+
+# Gestora 3 - preencher quando disponível
+MANAGER3_ID=
+MANAGER3_PHONE=
+MANAGER3_WEBHOOK=
+
+# Mapeamento Setor -> Gestora (aceita JSON ou pares "Setor=CHAVE" separados por ;) 
+# Chaves possíveis: PAOLA, MICHELE, G3
+SECTOR_MANAGER_MAP={"Geral":"PAOLA","Florianópolis":"PAOLA","São José":"MICHELE","Palhoça":"MICHELE","lojas":"G3","Gestora":"PAOLA"}
+```
+
+### Verificação via Admin
+
+- Acesse `admin.html` e informe o `ADMIN_TOKEN`.
+- Em "Por Gestora/Webhook" e no JSON de debug, veja:
+  - `sectorManagerMap` (mapeamento em uso)
+  - `managersConfigured` (se cada gestora tem webhook/phone configurado)
