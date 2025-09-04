@@ -166,16 +166,22 @@ function selectManagerBySector(sector) {
 }
 
 function extractSectorFromEvent(event, message) {
-  // Try common fields that might carry department/sector info
+  // Try common fields that might carry department/sector info, prioritizing specific fields
   const tryValues = [
-    event.sector, event.Sector,
-    event.department, event.Department,
-    event.queue, event.Queue,
-    event.tag, event.Tag,
-    event.team, event.Team,
-    (event.Payload && (event.Payload.Sector || event.Payload.Department || event.Payload.Queue || event.Payload.Tag || event.Payload.Team)),
-    (event.payload && (event.payload.Sector || event.payload.Department || event.payload.Queue || event.payload.Tag || event.payload.Team)),
-    message && (message.sector || message.department || message.queue || message.tag || message.team)
+    event.sector, event.Sector, event.department, event.Department, // Direct event fields
+    event.queue, event.Queue, event.tag, event.Tag, event.team, event.Team,
+    
+    // Nested within Payload.Content for Chat snapshots
+    (event.Payload && event.Payload.Content && (event.Payload.Content.Sector || event.Payload.Content.Department || event.Payload.Content.Queue || event.Payload.Content.Tag || event.Payload.Content.Team)),
+    (event.payload && event.payload.Content && (event.payload.Content.Sector || event.payload.Content.Department || event.payload.Content.Queue || event.payload.Content.Tag || event.payload.Content.Team)),
+
+    // Nested within message object
+    message && (message.sector || message.department || message.queue || message.tag || message.team),
+    
+    // Additional potential nested fields (e.g., in a 'context' or 'metadata' object)
+    (event.Context && (event.Context.Sector || event.Context.Department)),
+    (event.metadata && (event.metadata.sector || event.metadata.department))
+
   ].filter(Boolean);
   if (tryValues.length > 0) return String(tryValues[0]).trim();
   return 'Geral';
@@ -304,14 +310,41 @@ app.post('/api/webhook/utalk', async (req, res) => {
     const type = event.type || event.Type || event.event || '';
     let message = event.message || event.Message || event.payload || event.Payload || {};
 
-    // Default normalized fields
-    let conversationId = message.conversationId || message.chatId || message.ticketId || event.conversationId || null;
-    let fromPhone = (message.from && (message.from.phone || message.from.phoneNumber)) || message.fromPhone || message.contactPhone || event.fromPhone || null;
-    let fromName = (message.from && message.from.name) || message.contactName || event.fromName || null;
-    let attendantId = message.attendantId || message.agentId || event.assignedTo || event.attendantId || null;
+    // Robustly extract conversationId, fromPhone, fromName, attendantId, direction
+    let conversationId = 
+        event.conversationId || event.ConversationId ||
+        message.conversationId || message.chatId || message.ticketId ||
+        (message.Chat && message.Chat.Id) ||
+        (event.Payload && event.Payload.Content && event.Payload.Content.Id) ||
+        (event.payload && event.payload.Content && event.payload.Content.Id) ||
+        (message.Chat && message.Chat.Id) || null;
+
+    let fromPhone = 
+        event.fromPhone || event.FromPhone ||
+        message.fromPhone || message.contactPhone ||
+        (message.from && (message.from.phone || message.from.phoneNumber)) ||
+        (event.Payload && event.Payload.Content && event.Payload.Content.Contact && (event.Payload.Content.Contact.PhoneNumber || event.Payload.Content.Contact.Phone)) ||
+        (event.payload && event.payload.Content && event.payload.Content.Contact && (event.payload.Content.Contact.PhoneNumber || event.payload.Content.Contact.Phone)) ||
+        null;
+
+    let fromName =
+        event.fromName || event.FromName ||
+        message.fromName || message.contactName ||
+        (message.from && message.from.name) ||
+        (event.Payload && event.Payload.Content && event.Payload.Content.Contact && event.Payload.Content.Contact.Name) ||
+        (event.payload && event.payload.Content && event.payload.Content.Contact && event.payload.Content.Contact.Name) ||
+        null;
+        
+    let attendantId =
+        event.attendantId || event.AttendantId ||
+        message.attendantId || message.agentId || message.AssignedTo || event.assignedTo ||
+        (event.Payload && event.Payload.Content && event.Payload.Content.OrganizationMember && event.Payload.Content.OrganizationMember.Id) ||
+        (event.payload && event.payload.Content && event.payload.Content.OrganizationMember && event.payload.Content.OrganizationMember.Id) ||
+        (message.SentByOrganizationMember && message.SentByOrganizationMember.Id) || null;
+
     let direction = message.direction || event.direction || (typeof type === 'string' ? (type.includes('in') ? 'in' : type.includes('out') ? 'out' : '') : '');
 
-    // Handle Chat snapshot style (Payload.Type === 'Chat')
+    // Handle Chat snapshot style (Payload.Type === 'Chat') - this part is already quite robust, keep it
     const payloadType = (event.Payload && event.Payload.Type) || (event.payload && event.payload.Type) || null;
     const content = (event.Payload && event.Payload.Content) || (event.payload && event.payload.Content) || null;
     if (payloadType === 'Chat' && content) {
@@ -344,7 +377,7 @@ app.post('/api/webhook/utalk', async (req, res) => {
       || null;
     const key = conversationId || fromPhone || contactId;
 
-    // Extract sector for routing
+    // Extract sector for routing - enhance this as well
     const sector = extractSectorFromEvent(event, message);
 
     // Record for debug/observability
@@ -361,7 +394,7 @@ app.post('/api/webhook/utalk', async (req, res) => {
         sector
       });
       if (recentWebhookEvents.length > MAX_RECENT_EVENTS) recentWebhookEvents.pop();
-      console.log('Webhook received:', { type, direction, conversationId, fromPhone, attendantId });
+      console.log('Webhook received (processed):', { type, direction, conversationId, fromPhone, attendantId, sector, key }); // Enhanced logging
     }
 
     // Update conversation state; do NOT send here to avoid per-webhook sends
@@ -381,8 +414,9 @@ app.post('/api/webhook/utalk', async (req, res) => {
     } else {
       // Record skip reason for debug
       const reason = !key ? 'missing_key' : !direction ? 'missing_direction' : 'unknown';
-      recentWebhookSkips.unshift({ ts: new Date().toISOString(), reason, conversationId, fromPhone, type, payloadType });
+      recentWebhookSkips.unshift({ ts: new Date().toISOString(), reason, conversationId, fromPhone, type, payloadType, event });
       if (recentWebhookSkips.length > MAX_RECENT_EVENTS) recentWebhookSkips.pop();
+      console.error('Webhook skipped. Reason:', reason, { conversationId, fromPhone, type, payloadType, event, normalizedKey: key, normalizedDirection: direction }); // Even more enhanced logging
     }
 
     // Acknowledge quickly
