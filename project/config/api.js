@@ -19,6 +19,7 @@ class UTalkAPI {
       timeout: 30000
     });
 
+
     // Add response interceptor for error handling
     this.client.interceptors.response.use(
       (response) => response,
@@ -63,7 +64,7 @@ class UTalkAPI {
   // Get user information and organization ID
   async getMe() {
     try {
-      const response = await this.client.get('/v1/member/me');
+      const response = await this.client.get('/v1/members/me');
       return response.data;
     } catch (error) {
       console.error('Failed to get user info:', error.message);
