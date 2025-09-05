@@ -7,6 +7,7 @@
     "start": "node app.js",
     "test": "node sendMessage.js",
     "setup": "node setup.js",
+    "vercel-build": "echo 'Build completed'",
     "dev:ngrok": "echo Set your ngrok tunnel and use the printed URL",
     "test:webhook:idle": "node tests/webhookTester.js --scenario idle --baseUrl %BASE_URL%",
     "test:webhook:reply": "node tests/webhookTester.js --scenario reply --baseUrl %BASE_URL%",
@@ -14,13 +15,19 @@
     "verify:alerts": "node tests/verifyAlerts.js"
   },
   "dependencies": {
-    "axios": "^1.6.0",
-    "express": "^4.18.2",
+    "axios": "^1.11.0",
     "body-parser": "^1.20.2",
     "dotenv": "^16.3.1",
+    "express": "^4.18.2",
     "readline": "^1.3.0"
   },
-  "keywords": ["whatsapp", "api", "automation", "utalk", "umbler"],
+  "keywords": [
+    "whatsapp",
+    "api",
+    "automation",
+    "utalk",
+    "umbler"
+  ],
   "author": "Your Name",
   "license": "MIT"
 }
