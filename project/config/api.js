@@ -19,7 +19,6 @@ class UTalkAPI {
       timeout: 30000
     });
 
-
     // Add response interceptor for error handling
     this.client.interceptors.response.use(
       (response) => response,
@@ -170,6 +169,86 @@ class UTalkAPI {
     }
   }
 
+  // ===== NOVO MÉTODO: Enviar mensagem para chat específico =====
+  async sendMessageToChat(chatId, message, organizationId) {
+    try {
+      // Validate required parameters
+      if (!chatId) {
+        throw new Error('chatId is required');
+      }
+      if (!message) {
+        throw new Error('message is required');
+      }
+      if (!organizationId) {
+        throw new Error('organizationId is required');
+      }
+
+      console.log(`Enviando mensagem para chat ${chatId}:`, message.substring(0, 100) + '...');
+
+      // Primeiro, tenta enviar via endpoint de chat direto
+      try {
+        const chatPayload = {
+          ChatId: chatId,
+          OrganizationId: organizationId,
+          Message: message.trim(),
+          MessageType: 'Text'
+        };
+
+        const response = await this.client.post('/v1/chats/send-message/', chatPayload, {
+          headers: { 'Content-Type': 'application/json' }
+        });
+        
+        console.log(`✅ Mensagem enviada para chat ${chatId} via endpoint direto`);
+        return response.data;
+        
+      } catch (chatError) {
+        console.warn(`Endpoint de chat direto falhou, tentando método alternativo:`, chatError.message);
+        
+        // Método alternativo: enviar via endpoint de mensagens com chat ID
+        try {
+          const altPayload = {
+            chat_id: chatId,
+            organization_id: organizationId,
+            message: message.trim(),
+            message_type: 'text'
+          };
+
+          const altResponse = await this.client.post('/v1/messages/', altPayload, {
+            headers: { 'Content-Type': 'application/json' }
+          });
+          
+          console.log(`✅ Mensagem enviada para chat ${chatId} via método alternativo`);
+          return altResponse.data;
+          
+        } catch (altError) {
+          console.warn(`Método alternativo também falhou, tentando terceira opção:`, altError.message);
+          
+          // Terceira tentativa: usar endpoint interno de chat
+          const internalPayload = {
+            Id: chatId,
+            OrganizationId: organizationId,
+            Content: message.trim(),
+            Type: 'Text'
+          };
+
+          const internalResponse = await this.client.post('/v1/internal/chats/message/', internalPayload, {
+            headers: { 'Content-Type': 'application/json' }
+          });
+          
+          console.log(`✅ Mensagem enviada para chat ${chatId} via endpoint interno`);
+          return internalResponse.data;
+        }
+      }
+      
+    } catch (error) {
+      console.error(`❌ Falha ao enviar mensagem para chat ${chatId}:`, error.message);
+      if (error.response?.data) {
+        console.error('Detalhes do erro da API:', error.response.data);
+      }
+      throw new Error(`Failed to send message to chat ${chatId}: ${error.message}`);
+    }
+  }
+
   // Send a template message (for messages outside 24h window)
   async sendTemplateMessage(channelId, phoneNumber, templateName, parameters = [], organizationId) {
     try {
@@ -197,6 +276,34 @@ class UTalkAPI {
       return response.data;
     } catch (error) {
       console.error('Failed to get channel status:', error.message);
+      throw error;
+    }
+  }
+
+  // Get chat information
+  async getChatInfo(chatId) {
+    try {
+      const response = await this.client.get(`/v1/chats/${chatId}`);
+      return response.data;
+    } catch (error) {
+      console.error(`Failed to get chat info for ${chatId}:`, error.message);
+      throw error;
+    }
+  }
+
+  // List all chats (for debugging)
+  async getChats(organizationId, limit = 50) {
+    try {
+      const response = await this.client.get('/v1/chats/', {
+        params: {
+          organization_id: organizationId,
+          limit: limit,
+          ordering: '-created_at'
+        }
+      });
+      return response.data;
+    } catch (error) {
+      console.error('Failed to get chats:', error.message);
       throw error;
     }
   }
@@ -236,6 +343,29 @@ class UTalkAPI {
     if (link) lines.push(`🔗 *Link:* ${link}`);
     lines.push('');
     lines.push('_Mensagem enviada automaticamente via UTalk Bot_');
+    return lines.join('\n');
+  }
+
+  // ===== MÉTODO ESPECÍFICO PARA ALERTAS DE INATIVIDADE =====
+  formatInactivityAlert({ clientName, attendantName, idleMinutes, link, sector, timestamp }) {
+    const lines = [];
+    lines.push('🚨 *ALERTA DE INATIVIDADE*');
+    lines.push('');
+    lines.push(`👤 *Cliente:* ${clientName || 'Nome não informado'}`);
+    lines.push(`🧑‍💼 *Atendente:* ${attendantName || 'Não definido'}`);
+    lines.push(`📍 *Setor:* ${sector || 'Geral'}`);
+    lines.push(`⏱️ *Tempo sem resposta:* ${idleMinutes} minutos`);
+    
+    if (link) {
+      lines.push(`🔗 *Conversa:* ${link}`);
+    }
+    
+    lines.push(`📅 *Data/Hora:* ${timestamp || new Date().toLocaleString('pt-BR')}`);
+    lines.push('');
+    lines.push('⚠️ *Ação necessária:* Verificar e responder ao cliente');
+    lines.push('');
+    lines.push('_Alerta automático do sistema UTalk Bot_');
+    
     return lines.join('\n');
   }
 }

@@ -6,59 +6,25 @@ const { getAttendantNameById } = require('./config/attendants');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const MANAGER_PHONE = process.env.MANAGER_PHONE; // digits only with country code
-const MANAGER_PHONES = (process.env.MANAGER_PHONES || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-const MANAGER_WEBHOOKS = (process.env.MANAGER_WEBHOOKS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-const MANAGER_ATTENDANT_ID = process.env.MANAGER_ATTENDANT_ID; // optional ID mapping
+
+// ===== CONFIGURAÇÃO DO CHAT DE ALERTAS =====
+const ALERT_CHAT_ID = process.env.ALERT_CHAT_ID || 'aLrR-GU3ZQBaslwU';
+const MANAGER_PHONE = process.env.MANAGER_PHONE; // fallback apenas
+const MANAGER_ATTENDANT_ID = process.env.MANAGER_ATTENDANT_ID;
 const WEBHOOK_DEBUG = (process.env.WEBHOOK_DEBUG || 'true') === 'true';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
-// Sector-based routing configuration
-// Define manager configs (name keys are arbitrary but must match mapping values)
-const MANAGERS = {
-  PAOLA: {
-    id: process.env.MANAGER1_ID || 'ZUpCF58LSKZvBvJr',
-    phone: (process.env.MANAGER1_PHONE || '+55 48 98811-2957').replace(/\D/g, ''),
-    webhook: process.env.MANAGER1_WEBHOOK || ''
-  },
-  MICHELE: {
-    id: process.env.MANAGER2_ID || 'ZZRSipl_JmIQx5qg',
-    phone: (process.env.MANAGER2_PHONE || '+55 48 99622-2357').replace(/\D/g, ''),
-    webhook: process.env.MANAGER2_WEBHOOK || ''
-  },
-  G3: {
-    id: process.env.MANAGER3_ID || '',
-    phone: (process.env.MANAGER3_PHONE || '').replace(/\D/g, ''),
-    webhook: process.env.MANAGER3_WEBHOOK || ''
-  }
-};
-
-// Map sectors to manager keys. Accepts JSON or ";" separated pairs Sector=MANAGERKEY
-function parseSectorManagerMap(raw) {
-  if (!raw) return {};
-  try {
-    return JSON.parse(raw);
-  } catch (e) {
-    const map = {};
-    String(raw).split(';').map(s => s.trim()).filter(Boolean).forEach(pair => {
-      const [sector, managerKey] = pair.split('=').map(x => x && x.trim());
-      if (sector && managerKey) map[sector] = managerKey.toUpperCase();
-    });
-    return map;
-  }
-}
-const SECTOR_MANAGER_MAP = parseSectorManagerMap(process.env.SECTOR_MANAGER_MAP || '');
+// Configurações de tempo
+const IDLE_MS = Number(process.env.IDLE_MS || 15 * 60 * 1000); // 15 minutos padrão
+const MAX_IDLE_ALERT_MINUTES = Number(process.env.MAX_IDLE_ALERT_MINUTES || 60); // 60 min máx
+const BUSINESS_START_HOUR = Number(process.env.BUSINESS_START_HOUR || 9); // 09:00
+const BUSINESS_END_HOUR = Number(process.env.BUSINESS_END_HOUR || 17); // 17:00
 
 // Middleware
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
+
 function requireAdmin(req, res, next) {
   const token = req.headers['x-admin-token'] || req.query.token;
   if (ADMIN_TOKEN && token === ADMIN_TOKEN) return next();
@@ -75,21 +41,26 @@ try {
   process.exit(1);
 }
 
-// In-memory store for idle timers per conversation (e.g., by contact phone or conversation id)
-// Conversation state (in-memory; for production, use persistent store)
+// ===== SISTEMA DE MONITORAMENTO DE CONVERSAS =====
 const conversations = new Map(); // key -> { lastInboundAt, lastOutboundAt, alertedAt, meta }
 const recentWebhookEvents = [];
 const recentWebhookSkips = [];
 const MAX_RECENT_EVENTS = 200;
-const IDLE_MS = Number(process.env.IDLE_MS || 15 * 60 * 1000); // override via env
-const BUSINESS_START_HOUR = 9; // 09:00 local time
-const BUSINESS_END_HOUR = 17; // 17:00 local time (non-inclusive)
-const MAX_IDLE_ALERT_MINUTES = 60; // if >= 60 minutes de inatividade, não envia
 
+// Estatísticas de alertas
+const alertStats = {
+  totalAlertsSent: 0,
+  alertsToChat: 0,
+  alertsToFallback: 0,
+  byDay: {},
+  startTime: Date.now()
+};
+
+// ===== FUNÇÕES DE HORÁRIO COMERCIAL =====
 function isBusinessDay(date) {
   const d = new Date(date);
-  const day = d.getDay(); // 0=Sun, 6=Sat
-  return day >= 1 && day <= 5; // Mon-Fri
+  const day = d.getDay(); // 0=Dom, 6=Sáb
+  return day >= 1 && day <= 5; // Seg-Sex
 }
 
 function isWithinBusinessHours(date) {
@@ -107,216 +78,214 @@ function getBusinessWindowForDate(date) {
   return { start, end };
 }
 
+// Calcula tempo útil (horário comercial) entre duas datas
 function businessElapsedMs(startMs, endMs) {
   if (!startMs || !endMs || endMs <= startMs) return 0;
   let elapsed = 0;
   let cursor = new Date(startMs);
   const end = new Date(endMs);
-  // iterate by days
+  
   while (cursor < end) {
-    const { start, end: dayEnd } = getBusinessWindowForDate(cursor);
-    const dayStart = start;
-    const curEndOfWindow = dayEnd;
+    const { start: dayStart, end: dayEnd } = getBusinessWindowForDate(cursor);
+    
     if (isBusinessDay(cursor)) {
       const curStart = cursor > dayStart ? cursor : dayStart;
-      const curEnd = end < curEndOfWindow ? end : curEndOfWindow;
+      const curEnd = end < dayEnd ? end : dayEnd;
       if (curEnd > curStart) {
         elapsed += curEnd - curStart;
       }
     }
-    // move to next day 00:00
+    
+    // Move para próximo dia às 00:00
     const nextDay = new Date(dayStart);
     nextDay.setDate(nextDay.getDate() + 1);
     cursor = nextDay;
   }
+  
   return elapsed;
 }
 
-function stableHash(str) {
-  let h = 0;
-  for (let i = 0; i < str.length; i++) {
-    h = (h * 31 + str.charCodeAt(i)) | 0;
-  }
-  return Math.abs(h);
-}
-
-function selectManagerPhoneForKey(key) {
-  if (MANAGER_PHONES.length > 0) {
-    const idx = stableHash(key) % MANAGER_PHONES.length;
-    return MANAGER_PHONES[idx];
-  }
-  return MANAGER_PHONE;
-}
-
-function selectManagerWebhookForKey(key) {
-  if (MANAGER_WEBHOOKS.length > 0) {
-    const idx = stableHash(key) % MANAGER_WEBHOOKS.length;
-    return MANAGER_WEBHOOKS[idx];
-  }
-  return null;
-}
-
-function selectManagerBySector(sector) {
-  const managerKey = (SECTOR_MANAGER_MAP[sector] || '').toUpperCase();
-  if (managerKey && MANAGERS[managerKey]) {
-    const m = MANAGERS[managerKey];
-    return { managerKey, webhook: m.webhook || null, phone: m.phone || null };
-  }
-  return null;
-}
-
-function extractSectorFromEvent(event, message) {
-  // Try common fields that might carry department/sector info, prioritizing specific fields
-  const tryValues = [
-    // Direct event fields
-    event.sector, event.Sector, event.department, event.Department,
-    event.queue, event.Queue, event.tag, event.Tag, event.team, event.Team,
-    
-    // Nested within Payload.Content for Chat snapshots  
-    (event.Payload && event.Payload.Content && (
-      event.Payload.Content.Sector || event.Payload.Content.Department || 
-      event.Payload.Content.Queue || event.Payload.Content.Tag || 
-      event.Payload.Content.Team || event.Payload.Content.sector ||
-      event.Payload.Content.department
-    )),
-    (event.payload && event.payload.Content && (
-      event.payload.Content.Sector || event.payload.Content.Department || 
-      event.payload.Content.Queue || event.payload.Content.Tag || 
-      event.payload.Content.Team || event.payload.Content.sector ||
-      event.payload.Content.department
-    )),
-
-    // Nested within message object  
-    message && (message.sector || message.Sector || message.department || 
-               message.Department || message.queue || message.Queue || 
-               message.tag || message.Tag || message.team || message.Team),
-    
-    // Additional potential nested fields
-    (event.Context && (event.Context.Sector || event.Context.Department || 
-                      event.Context.sector || event.Context.department)),
-    (event.metadata && (event.metadata.sector || event.metadata.department ||
-                       event.metadata.Sector || event.metadata.Department)),
-    (event.context && (event.context.sector || event.context.department ||
-                      event.context.Sector || event.context.Department))
-
-  ].filter(Boolean);
-  
-  if (tryValues.length > 0) return String(tryValues[0]).trim();
-  return 'Geral';
-}
-
-// Stats for admin
-const alertStats = {
-  totalAlertsSent: 0,
-  byManager: {},
-  byDay: {}
-};
-
-function recordAlertStat(targetKey, whenMs) {
-  alertStats.totalAlertsSent += 1;
-  if (targetKey) {
-    alertStats.byManager[targetKey] = (alertStats.byManager[targetKey] || 0) + 1;
-  }
-  const day = new Date(whenMs).toISOString().slice(0, 10);
-  alertStats.byDay[day] = (alertStats.byDay[day] || 0) + 1;
-}
-
-async function maybeSendDueAlerts(now = Date.now()) {
-  const hasAnyManager = MANAGER_WEBHOOKS.length > 0 || MANAGER_PHONES.length > 0 || MANAGER_PHONE;
-  if (!hasAnyManager) return;
-  
+// ===== ENVIO DE ALERTAS PARA CHAT ESPECÍFICO =====
+async function sendAlertToChat(conversationData) {
   const organizationId = process.env.ORGANIZATION_ID;
   const channelId = process.env.CHANNEL_ID;
   
-  console.log('=== CHECKING FOR DUE ALERTS ===');
-  console.log('Total conversations:', conversations.size);
-  console.log('Current time:', new Date(now).toISOString());
-  console.log('Business hours check:', isWithinBusinessHours(now));
+  if (!ALERT_CHAT_ID) {
+    console.warn('ALERT_CHAT_ID não configurado, usando fallback');
+    return await sendAlertFallback(conversationData);
+  }
+
+  const { key, clientName, attendantName, idleMinutes, link, sector } = conversationData;
+  
+  // Mensagem formatada para o chat de alertas
+  const alertMessage = `🚨 *ALERTA DE INATIVIDADE*
+
+👤 *Cliente:* ${clientName || 'Nome não informado'}
+🧑‍💼 *Atendente:* ${attendantName || 'Não definido'}
+📍 *Setor:* ${sector || 'Geral'}
+⏱️ *Tempo sem resposta:* ${idleMinutes} minutos
+🔗 *Link da conversa:* ${link || 'Não disponível'}
+📅 *Data/Hora:* ${new Date().toLocaleString('pt-BR')}
+
+_Alerta automático do sistema UTalk Bot_`;
+
+  try {
+    console.log(`[${key}] Enviando alerta para chat ${ALERT_CHAT_ID}`);
+    
+    // Envia mensagem diretamente para o chat através da API
+    const result = await api.sendMessageToChat(ALERT_CHAT_ID, alertMessage, organizationId);
+    
+    alertStats.totalAlertsSent++;
+    alertStats.alertsToChat++;
+    
+    const today = new Date().toISOString().slice(0, 10);
+    alertStats.byDay[today] = (alertStats.byDay[today] || 0) + 1;
+    
+    console.log(`[${key}] ✅ Alerta enviado com sucesso para chat ${ALERT_CHAT_ID}`);
+    return { success: true, target: 'chat', result };
+    
+  } catch (error) {
+    console.error(`[${key}] ❌ Erro ao enviar para chat ${ALERT_CHAT_ID}:`, error.message);
+    
+    // Fallback para telefone se chat falhar
+    console.log(`[${key}] Tentando fallback...`);
+    return await sendAlertFallback(conversationData);
+  }
+}
+
+// Fallback caso o chat não funcione
+async function sendAlertFallback(conversationData) {
+  if (!MANAGER_PHONE) {
+    console.warn('Nenhum fallback configurado (MANAGER_PHONE)');
+    return { success: false, error: 'No fallback configured' };
+  }
+
+  const organizationId = process.env.ORGANIZATION_ID;
+  const channelId = process.env.CHANNEL_ID;
+  const { key, clientName, attendantName, idleMinutes, link } = conversationData;
+  
+  const fallbackMessage = api.formatOrganizedNotification({
+    clientName,
+    attendantName,
+    idleTime: `${idleMinutes} minutos`,
+    link
+  });
+
+  try {
+    console.log(`[${key}] Enviando fallback para WhatsApp ${MANAGER_PHONE}`);
+    const result = await api.sendMessage(channelId, MANAGER_PHONE, fallbackMessage, organizationId);
+    
+    alertStats.totalAlertsSent++;
+    alertStats.alertsToFallback++;
+    
+    const today = new Date().toISOString().slice(0, 10);
+    alertStats.byDay[today] = (alertStats.byDay[today] || 0) + 1;
+    
+    console.log(`[${key}] ✅ Alerta fallback enviado com sucesso`);
+    return { success: true, target: 'fallback', result };
+    
+  } catch (error) {
+    console.error(`[${key}] ❌ Erro no fallback:`, error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+// ===== VERIFICAÇÃO DE ALERTAS DEVIDOS =====
+async function checkAndSendDueAlerts(now = Date.now()) {
+  if (!ALERT_CHAT_ID && !MANAGER_PHONE) {
+    console.warn('Nenhum destino de alerta configurado');
+    return;
+  }
+  
+  console.log('=== VERIFICANDO ALERTAS DEVIDOS ===');
+  console.log('Total conversas monitoradas:', conversations.size);
+  console.log('Horário atual:', new Date(now).toLocaleString('pt-BR'));
+  console.log('Dentro do horário comercial:', isWithinBusinessHours(now));
+  console.log('Chat de alertas:', ALERT_CHAT_ID);
+  
+  let alertsSent = 0;
   
   for (const [key, state] of conversations.entries()) {
     const { lastInboundAt, lastOutboundAt, alertedAt, meta } = state;
     
+    // Pula se não há mensagem de entrada
     if (!lastInboundAt) continue;
     
     const replied = lastOutboundAt && lastOutboundAt >= lastInboundAt;
     const businessElapsed = businessElapsedMs(lastInboundAt, now);
+    const idleMinutes = Math.round(businessElapsed / 60000);
     const overdue = businessElapsed >= IDLE_MS;
     const alreadyAlerted = Boolean(alertedAt) && alertedAt >= lastInboundAt;
-    const overCap = businessElapsed >= MAX_IDLE_ALERT_MINUTES * 60000; // >= 60 min úteis
-    const nowWithinHours = isWithinBusinessHours(now);
+    const overCap = businessElapsed >= MAX_IDLE_ALERT_MINUTES * 60000;
+    const withinBusinessHours = isWithinBusinessHours(now);
     
-    console.log(`[${key}] Checking conversation:`, {
-      lastInboundAt: new Date(lastInboundAt).toISOString(),
-      lastOutboundAt: lastOutboundAt ? new Date(lastOutboundAt).toISOString() : null,
+    console.log(`[${key}] Análise da conversa:`, {
+      lastInboundAt: new Date(lastInboundAt).toLocaleString('pt-BR'),
+      lastOutboundAt: lastOutboundAt ? new Date(lastOutboundAt).toLocaleString('pt-BR') : null,
       replied,
-      businessElapsed: Math.round(businessElapsed / 60000) + ' min',
+      businessElapsedMinutes: idleMinutes,
       overdue,
       alreadyAlerted,
       overCap,
-      nowWithinHours
+      withinBusinessHours,
+      clientName: meta.clientName,
+      attendantName: meta.attendantName
     });
     
-    if (!replied && overdue && !overCap && !alreadyAlerted && nowWithinHours) {
-      console.log(`[${key}] SENDING ALERT - Conditions met`);
+    // Condições para enviar alerta:
+    // 1. Não foi respondida pelo atendente
+    // 2. Tempo de inatividade >= IDLE_MS
+    // 3. Não foi enviado alerta ainda
+    // 4. Não passou do tempo máximo
+    // 5. Está dentro do horário comercial
+    if (!replied && overdue && !alreadyAlerted && !overCap && withinBusinessHours) {
+      console.log(`[${key}] 🚨 ENVIANDO ALERTA - Todas condições atendidas`);
       
-      const attendantName = getAttendantNameById(meta.attendantId) || meta.attendantName || 'Atendente Responsável';
-      const clientName = meta.clientName || meta.fromName || meta.fromPhone;
-      const link = meta.link || '';
-      const minutes = Math.round(businessElapsed / 60000);
+      const conversationData = {
+        key,
+        clientName: meta.clientName || meta.fromName || meta.fromPhone || 'Cliente',
+        attendantName: meta.attendantName || getAttendantNameById(meta.attendantId) || 'Atendente',
+        idleMinutes,
+        link: meta.link || `https://app-utalk.umbler.com/chats/${meta.conversationId || key}`,
+        sector: meta.sector || 'Geral'
+      };
       
-      // Prefer sector-based routing if sector is known
-      const sector = meta.sector || 'Geral';
-      const sectorTarget = selectManagerBySector(sector);
-      const managerWebhook = (sectorTarget && sectorTarget.webhook) || selectManagerWebhookForKey(key);
-      const managerPhone = (sectorTarget && sectorTarget.phone) || selectManagerPhoneForKey(key);
+      const result = await sendAlertToChat(conversationData);
       
-      const alertMessage = api.formatOrganizedNotification({ clientName, attendantName, idleTime: `${minutes} minutos`, link });
-      
-      try {
-        if (managerWebhook) {
-          console.log(`[${key}] Sending webhook alert:`, { sector, webhook: managerWebhook, clientName, attendantName, minutes });
-          await require('axios').post(managerWebhook, {
-            type: 'idle-alert',
-            conversationId: key,
-            clientName,
-            attendantName,
-            idleMinutes: minutes,
-            link,
-            sector,
-            occurredAt: new Date(now).toISOString()
-          }, { headers: { 'Content-Type': 'application/json' } });
-          recordAlertStat(managerWebhook, now);
-        } else if (managerPhone) {
-          console.log(`[${key}] Sending WhatsApp alert:`, { sector, phone: managerPhone, clientName, attendantName, minutes });
-          await api.sendMessage(channelId, managerPhone, alertMessage, organizationId);
-          recordAlertStat(managerPhone, now);
-        } else {
-          console.warn(`[${key}] No manager target configured`);
-        }
+      if (result.success) {
         state.alertedAt = now;
-        console.log(`[${key}] Alert sent successfully`);
-      } catch (e) {
-        console.error(`[${key}] Failed to send alert:`, e.message);
+        alertsSent++;
+        console.log(`[${key}] ✅ Alerta enviado com sucesso via ${result.target}`);
+      } else {
+        console.error(`[${key}] ❌ Falha ao enviar alerta:`, result.error);
       }
     } else {
-      console.log(`[${key}] No alert needed:`, {
-        replied,
-        overdue,
-        alreadyAlerted,
-        nowWithinHours,
-        overCap
-      });
+      // Log do motivo de não enviar
+      const reasons = [];
+      if (replied) reasons.push('já_respondida');
+      if (!overdue) reasons.push('não_expirada');
+      if (alreadyAlerted) reasons.push('já_alertada');
+      if (overCap) reasons.push('tempo_excedido');
+      if (!withinBusinessHours) reasons.push('fora_horário_comercial');
+      
+      if (reasons.length > 0) {
+        console.log(`[${key}] ⏸️ Não envia alerta: ${reasons.join(', ')}`);
+      }
     }
   }
-  console.log('=== ALERT CHECK COMPLETE ===');
+  
+  console.log(`=== VERIFICAÇÃO COMPLETA - ${alertsSent} alertas enviados ===`);
+  return alertsSent;
 }
 
-// Serve main page
+// ===== ENDPOINTS DA API =====
+
+// Página principal
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// API endpoint to get account info
+// Informações da conta
 app.get('/api/info', async (req, res) => {
   try {
     const userInfo = await api.getMe();
@@ -328,7 +297,10 @@ app.get('/api/info', async (req, res) => {
       channels: channels.results || [],
       config: {
         organizationId: process.env.ORGANIZATION_ID,
-        channelId: process.env.CHANNEL_ID
+        channelId: process.env.CHANNEL_ID,
+        alertChatId: ALERT_CHAT_ID,
+        idleMinutes: IDLE_MS / 60000,
+        businessHours: `${BUSINESS_START_HOUR}:00 - ${BUSINESS_END_HOUR}:00`
       }
     });
   } catch (error) {
@@ -339,7 +311,7 @@ app.get('/api/info', async (req, res) => {
   }
 });
 
-// API endpoint to get channel status
+// Status do canal
 app.get('/api/channel-status/:channelId', async (req, res) => {
   try {
     const channelStatus = await api.getChannelStatus(req.params.channelId);
@@ -355,36 +327,35 @@ app.get('/api/channel-status/:channelId', async (req, res) => {
   }
 });
 
-// Webhook endpoint to receive UTalk events/messages
-// Configure this URL in UTalk dashboard (POST)
+// ===== WEBHOOK PRINCIPAL =====
 app.post('/api/webhook/utalk', async (req, res) => {
   try {
     const event = req.body || {};
     
     if (WEBHOOK_DEBUG) {
-      console.log('=== RAW WEBHOOK RECEIVED ===');
-      console.log(JSON.stringify(event, null, 2));
-      console.log('================================');
+      console.log('=== WEBHOOK RECEBIDO ===');
+      console.log('Timestamp:', new Date().toISOString());
+      console.log('Event:', JSON.stringify(event, null, 2));
+      console.log('=========================');
     }
 
-    // Extract webhook data with improved logic
     const webhookData = extractWebhookData(event);
     
     if (WEBHOOK_DEBUG) {
-      console.log('=== EXTRACTED WEBHOOK DATA ===');
-      console.log(JSON.stringify(webhookData, null, 2));
-      console.log('===============================');
+      console.log('=== DADOS EXTRAÍDOS ===');
+      console.log('Data:', JSON.stringify(webhookData, null, 2));
+      console.log('======================');
     }
 
     const { conversationId, fromPhone, fromName, attendantId, direction, sector, messageText } = webhookData;
 
-    // Build conversation link
+    // Link da conversa
     const conversationLink = conversationId ? `https://app-utalk.umbler.com/chats/${conversationId}` : null;
 
-    // Build key for tracking (priority: conversationId > fromPhone)
+    // Chave para rastreamento (prioridade: conversationId > fromPhone)
     const key = conversationId || fromPhone;
 
-    // Record for debug/observability
+    // Registra evento para debug
     if (WEBHOOK_DEBUG) {
       recentWebhookEvents.unshift({
         ts: new Date().toISOString(),
@@ -398,71 +369,94 @@ app.post('/api/webhook/utalk', async (req, res) => {
         sector,
         messageText: messageText ? messageText.substring(0, 100) : null
       });
-      if (recentWebhookEvents.length > MAX_RECENT_EVENTS) recentWebhookEvents.pop();
-      console.log('=== WEBHOOK PROCESSED ===');
-      console.log('Key:', key);
-      console.log('Direction:', direction);
-      console.log('ConversationId:', conversationId);
-      console.log('FromPhone:', fromPhone);
-      console.log('AttendantId:', attendantId);
-      console.log('Sector:', sector);
-      console.log('========================');
+      if (recentWebhookEvents.length > MAX_RECENT_EVENTS) {
+        recentWebhookEvents.pop();
+      }
     }
 
-    // Update conversation state; do NOT send here to avoid per-webhook sends
+    // Atualiza estado da conversa
     if (key && direction) {
       const now = Date.now();
-      const state = conversations.get(key) || { lastInboundAt: null, lastOutboundAt: null, alertedAt: null, meta: {} };
+      const state = conversations.get(key) || {
+        lastInboundAt: null,
+        lastOutboundAt: null,
+        alertedAt: null,
+        meta: {}
+      };
       
       if (direction === 'in') {
-        console.log(`[${key}] CLIENT MESSAGE - Resetting alert timer`);
+        console.log(`[${key}] 📨 MENSAGEM DO CLIENTE - Iniciando monitoramento`);
         state.lastInboundAt = now;
-        // reset alert marker on new inbound
-        state.alertedAt = null;
-        state.meta = { 
-          attendantId: null, // Client message has no attendant
-          fromPhone, 
-          fromName, 
-          clientName: fromName, 
-          link: conversationLink, 
-          sector,
+        state.alertedAt = null; // Reset alerta em nova mensagem do cliente
+        state.meta = {
+          conversationId,
+          attendantId: null,
+          fromPhone,
+          fromName,
+          clientName: fromName,
+          link: conversationLink,
+          sector: sector || 'Geral',
           lastMessageText: messageText
         };
+        
+        console.log(`[${key}] ⏰ Timer de ${IDLE_MS/60000} minutos iniciado`);
+        
       } else if (direction === 'out') {
-        console.log(`[${key}] ATTENDANT MESSAGE - Canceling alert timer`);
+        console.log(`[${key}] 📤 RESPOSTA DO ATENDENTE - Cancelando timer`);
         state.lastOutboundAt = now;
-        // Update attendant info but keep client info
-        state.meta = { 
+        // Mantém informações do cliente, atualiza atendente
+        state.meta = {
           ...state.meta,
-          attendantId, 
+          attendantId,
           attendantName: getAttendantNameById(attendantId),
           lastMessageText: messageText
         };
+        
+        // Se havia timer ativo, cancela
+        const timeSinceInbound = state.lastInboundAt ? now - state.lastInboundAt : 0;
+        console.log(`[${key}] ✅ Timer cancelado após ${Math.round(timeSinceInbound/60000)} minutos`);
       }
+      
       conversations.set(key, state);
+      
+      // Log resumido do estado
+      console.log(`[${key}] Estado atualizado:`, {
+        hasInbound: Boolean(state.lastInboundAt),
+        hasOutbound: Boolean(state.lastOutboundAt),
+        needsAlert: state.lastInboundAt && (!state.lastOutboundAt || state.lastOutboundAt < state.lastInboundAt) && !state.alertedAt,
+        clientName: state.meta.clientName,
+        attendantName: state.meta.attendantName,
+        sector: state.meta.sector
+      });
+      
     } else {
-      // Record skip reason for debug
-      const reason = !key ? 'missing_key' : !direction ? 'missing_direction' : 'other';
-      recentWebhookSkips.unshift({ ts: new Date().toISOString(), reason, conversationId, fromPhone, type, payloadType, event });
-      if (recentWebhookSkips.length > MAX_RECENT_EVENTS) recentWebhookSkips.pop();
-      console.error('=== WEBHOOK SKIPPED ===');
-      console.error('Reason:', reason);
-      console.error('Key:', key);
-      console.error('Direction:', direction);
-      console.error('ConversationId:', conversationId);
-      console.error('FromPhone:', fromPhone);
-      console.error('======================');
+      // Registra pulos para debug
+      const reason = !key ? 'chave_ausente' : !direction ? 'direção_ausente' : 'outro';
+      recentWebhookSkips.unshift({
+        ts: new Date().toISOString(),
+        reason,
+        conversationId,
+        fromPhone,
+        event: JSON.stringify(event).substring(0, 200)
+      });
+      if (recentWebhookSkips.length > MAX_RECENT_EVENTS) {
+        recentWebhookSkips.pop();
+      }
+      
+      console.warn(`[WEBHOOK] ⚠️ Evento ignorado - ${reason}:`, {
+        key, direction, conversationId, fromPhone
+      });
     }
 
-    // Acknowledge quickly
     res.json({ ok: true });
+    
   } catch (error) {
-    console.error('Webhook handling error:', error);
-    res.status(200).json({ ok: true });
+    console.error('Erro no webhook:', error);
+    res.status(200).json({ ok: true }); // Sempre retorna OK para não quebrar UTalk
   }
 });
 
-// Enhanced webhook data extraction function
+// Função para extrair dados do webhook
 function extractWebhookData(event) {
   let conversationId = null;
   let fromPhone = null;
@@ -472,12 +466,11 @@ function extractWebhookData(event) {
   let messageText = null;
   let sector = 'Geral';
 
-  // Check for Chat snapshot format (most common)
+  // Formato Chat snapshot (mais comum)
   const payloadType = (event.Payload && event.Payload.Type) || (event.payload && event.payload.Type);
   const content = (event.Payload && event.Payload.Content) || (event.payload && event.payload.Content);
   
   if (payloadType === 'Chat' && content) {
-    // Chat snapshot webhook
     const lastMessage = content.LastMessage || {};
     
     conversationId = content.Id || (lastMessage.Chat && lastMessage.Chat.Id);
@@ -485,7 +478,7 @@ function extractWebhookData(event) {
     fromName = (content.Contact && content.Contact.Name);
     messageText = lastMessage.Text || lastMessage.Content || lastMessage.MessageText;
     
-    // Determine direction based on message source
+    // Determina direção baseada na origem da mensagem
     const messageSource = lastMessage.Source;
     const sentByMember = lastMessage.SentByOrganizationMember;
     
@@ -497,14 +490,13 @@ function extractWebhookData(event) {
       attendantId = sentByMember.Id;
     }
     
-    // Extract sector from various possible locations
+    // Extrai setor
     sector = extractSectorFromEvent(event, content) || 'Geral';
     
   } else {
-    // Direct message webhook or other formats
+    // Formato direto de mensagem
     const message = event.message || event.Message || event.payload || event.Payload || {};
     
-    // Try multiple extraction patterns
     conversationId = event.conversationId || event.ConversationId || 
                     message.conversationId || message.chatId || message.ticketId ||
                     (message.Chat && message.Chat.Id);
@@ -523,20 +515,19 @@ function extractWebhookData(event) {
     
     messageText = message.text || message.Text || message.content || message.Content || message.message;
     
-    // Determine direction
     direction = message.direction || event.direction;
     if (!direction) {
       const type = event.type || event.Type || '';
       if (type.includes('in') || type.includes('inbound')) direction = 'in';
       else if (type.includes('out') || type.includes('outbound')) direction = 'out';
       else if (attendantId) direction = 'out';
-      else direction = 'in'; // Default assumption
+      else direction = 'in'; // Assume entrada por padrão
     }
     
     sector = extractSectorFromEvent(event, message) || 'Geral';
   }
 
-  // Normalize phone number
+  // Normaliza telefone
   if (fromPhone) {
     fromPhone = String(fromPhone).replace(/\D/g, '');
     if (fromPhone.length === 0) fromPhone = null;
@@ -553,96 +544,149 @@ function extractWebhookData(event) {
   };
 }
 
-// Debug endpoint to verify webhook arrivals and internal state
+// Extrai setor do evento
+function extractSectorFromEvent(event, message) {
+  const tryValues = [
+    event.sector, event.Sector, event.department, event.Department,
+    event.queue, event.Queue, event.tag, event.Tag, event.team, event.Team,
+    
+    (event.Payload && event.Payload.Content && (
+      event.Payload.Content.Sector || event.Payload.Content.Department || 
+      event.Payload.Content.Queue || event.Payload.Content.Tag || 
+      event.Payload.Content.Team || event.Payload.Content.sector ||
+      event.Payload.Content.department
+    )),
+    
+    message && (message.sector || message.Sector || message.department || 
+               message.Department || message.queue || message.Queue || 
+               message.tag || message.Tag || message.team || message.Team),
+    
+    (event.Context && (event.Context.Sector || event.Context.Department || 
+                      event.Context.sector || event.Context.department)),
+    (event.metadata && (event.metadata.sector || event.metadata.department ||
+                       event.metadata.Sector || event.metadata.Department))
+  ].filter(Boolean);
+  
+  if (tryValues.length > 0) return String(tryValues[0]).trim();
+  return 'Geral';
+}
+
+// ===== ENDPOINTS DE DEBUG E ADMIN =====
+
+// Debug do webhook
 app.get('/api/webhook/utalk/debug', requireAdmin, (req, res) => {
   try {
     const states = Array.from(conversations.entries()).map(([key, s]) => ({
       key,
-      lastInboundAt: s.lastInboundAt,
-      lastOutboundAt: s.lastOutboundAt,
-      alertedAt: s.alertedAt,
+      lastInboundAt: s.lastInboundAt ? new Date(s.lastInboundAt).toLocaleString('pt-BR') : null,
+      lastOutboundAt: s.lastOutboundAt ? new Date(s.lastOutboundAt).toLocaleString('pt-BR') : null,
+      alertedAt: s.alertedAt ? new Date(s.alertedAt).toLocaleString('pt-BR') : null,
       sector: s.meta && s.meta.sector,
       clientName: s.meta && s.meta.clientName,
       attendantId: s.meta && s.meta.attendantId,
       attendantName: s.meta && s.meta.attendantName,
       link: s.meta && s.meta.link,
-      timeSinceLastInbound: s.lastInboundAt ? Math.round((Date.now() - s.lastInboundAt) / 60000) + ' min' : null,
-      businessElapsed: s.lastInboundAt ? Math.round(businessElapsedMs(s.lastInboundAt, Date.now()) / 60000) + ' min' : null,
-      shouldAlert: s.lastInboundAt && !s.alertedAt && 
-                   (!s.lastOutboundAt || s.lastOutboundAt < s.lastInboundAt) &&
-                   businessElapsedMs(s.lastInboundAt, Date.now()) >= IDLE_MS &&
-                   businessElapsedMs(s.lastInboundAt, Date.now()) < MAX_IDLE_ALERT_MINUTES * 60000 &&
-                   isWithinBusinessHours(Date.now())
+      businessElapsedMinutes: s.lastInboundAt ? Math.round(businessElapsedMs(s.lastInboundAt, Date.now()) / 60000) : null,
+      needsAlert: s.lastInboundAt && !s.alertedAt && 
+                 (!s.lastOutboundAt || s.lastOutboundAt < s.lastInboundAt) &&
+                 businessElapsedMs(s.lastInboundAt, Date.now()) >= IDLE_MS &&
+                 businessElapsedMs(s.lastInboundAt, Date.now()) < MAX_IDLE_ALERT_MINUTES * 60000 &&
+                 isWithinBusinessHours(Date.now())
     }));
     
     res.json({
       success: true,
-      currentTime: new Date().toISOString(),
+      currentTime: new Date().toLocaleString('pt-BR'),
       isBusinessHours: isWithinBusinessHours(Date.now()),
+      alertChatId: ALERT_CHAT_ID,
       conversations: states,
-      idleMs: IDLE_MS,
       idleMinutes: IDLE_MS / 60000,
       maxIdleAlertMinutes: MAX_IDLE_ALERT_MINUTES,
       businessHours: { startHour: BUSINESS_START_HOUR, endHour: BUSINESS_END_HOUR },
-      managerPhones: MANAGER_PHONES.length ? MANAGER_PHONES : (MANAGER_PHONE ? [MANAGER_PHONE] : []),
-      managerWebhooks: MANAGER_WEBHOOKS,
-      sectorManagerMap: SECTOR_MANAGER_MAP,
-      managersConfigured: Object.fromEntries(Object.entries(MANAGERS).map(([k, v]) => [k, { hasWebhook: Boolean(v.webhook), hasPhone: Boolean(v.phone) } ])),
-      stats: alertStats,
-      recentCount: recentWebhookEvents.length,
-      recentSample: recentWebhookEvents.slice(0, 20),
-      recentSkips: recentWebhookSkips.slice(0, 20),
+      stats: {
+        ...alertStats,
+        uptimeHours: Math.round((Date.now() - alertStats.startTime) / 3600000 * 100) / 100
+      },
+      recentEventsCount: recentWebhookEvents.length,
+      recentEventsSample: recentWebhookEvents.slice(0, 10),
+      recentSkips: recentWebhookSkips.slice(0, 10),
       totalConversations: conversations.size,
-      conversationsNeedingAlert: states.filter(s => s.shouldAlert).length
+      conversationsNeedingAlert: states.filter(s => s.needsAlert).length
     });
   } catch (e) {
     res.json({ success: false, error: e.message });
   }
 });
 
-// Cron/sweep endpoint to evaluate due alerts
+// Força verificação de alertas
 app.post('/api/webhook/utalk/sweep', requireAdmin, async (req, res) => {
   try {
-    await maybeSendDueAlerts(Date.now());
-    res.json({ success: true });
+    const alertsSent = await checkAndSendDueAlerts(Date.now());
+    res.json({ 
+      success: true, 
+      alertsSent,
+      message: `Verificação concluída. ${alertsSent} alertas enviados.`
+    });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
-// Admin: reset stats
+// Reset estatísticas
 app.post('/api/admin/reset-stats', requireAdmin, (req, res) => {
   alertStats.totalAlertsSent = 0;
-  alertStats.byManager = {};
+  alertStats.alertsToChat = 0;
+  alertStats.alertsToFallback = 0;
   alertStats.byDay = {};
-  res.json({ success: true });
+  alertStats.startTime = Date.now();
+  res.json({ success: true, message: 'Estatísticas resetadas' });
 });
 
-// Manual test endpoint to send an immediate alert to manager
-app.post('/api/test/send-manager-alert', async (req, res) => {
+// ===== ENDPOINTS DE TESTE =====
+
+// Teste de alerta manual
+app.post('/api/test/send-alert', async (req, res) => {
   try {
-    if (!MANAGER_PHONE) {
-      return res.status(400).json({ success: false, error: 'MANAGER_PHONE is not configured' });
-    }
-    const organizationId = process.env.ORGANIZATION_ID;
-    const channelId = process.env.CHANNEL_ID;
-    const { clientName = 'Cliente Teste', attendantId = MANAGER_ATTENDANT_ID, conversationId = 'TEST_CONV_MANUAL' } = req.body || {};
-    const attendantName = getAttendantNameById(attendantId) || 'Atendente';
-    const link = `https://app-utalk.umbler.com/chats/${conversationId}`;
-    const alertMessage = api.formatOrganizedNotification({ clientName, attendantName, idleTime: '15 minutos', link });
-    const result = await api.sendMessage(channelId, MANAGER_PHONE, alertMessage, organizationId);
-    res.json({ success: true, data: result, sentMessage: alertMessage });
+    const { 
+      clientName = 'Cliente Teste',
+      attendantName = 'Atendente Teste',
+      idleMinutes = 15,
+      sector = 'Geral'
+    } = req.body;
+    
+    const conversationData = {
+      key: `TEST_${Date.now()}`,
+      clientName,
+      attendantName,
+      idleMinutes,
+      link: 'https://app-utalk.umbler.com/chats/TEST_CONVERSATION',
+      sector
+    };
+    
+    const result = await sendAlertToChat(conversationData);
+    
+    res.json({
+      success: true,
+      message: 'Teste de alerta executado',
+      result,
+      sentTo: ALERT_CHAT_ID,
+      fallbackUsed: result.target === 'fallback'
+    });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
-// Test endpoint to simulate client message (inbound)
+// Simular mensagem de cliente
 app.post('/api/test/simulate-client-message', async (req, res) => {
   try {
-    const { conversationId = 'TEST_CONV_CLIENT', clientPhone = '5511999999999', clientName = 'Cliente Teste', sector = 'Geral' } = req.body;
+    const {
+      conversationId = `TEST_CONV_${Date.now()}`,
+      clientPhone = '5511999999999',
+      clientName = 'Cliente Teste',
+      sector = 'Geral'
+    } = req.body;
     
-    // Simulate UTalk webhook for client message
     const simulatedWebhook = {
       Type: 'Message',
       Payload: {
@@ -655,7 +699,7 @@ app.post('/api/test/simulate-client-message', async (req, res) => {
           },
           LastMessage: {
             Source: 'Contact',
-            Text: 'Olá, preciso de ajuda!',
+            Text: 'Olá, preciso de ajuda urgente!',
             Chat: { Id: conversationId }
           }
         }
@@ -663,36 +707,42 @@ app.post('/api/test/simulate-client-message', async (req, res) => {
       Sector: sector
     };
     
-    // Process the webhook
     const webhookData = extractWebhookData(simulatedWebhook);
     const key = webhookData.conversationId || webhookData.fromPhone;
     
     if (key && webhookData.direction === 'in') {
       const now = Date.now();
-      const state = conversations.get(key) || { lastInboundAt: null, lastOutboundAt: null, alertedAt: null, meta: {} };
-      
-      state.lastInboundAt = now;
-      state.alertedAt = null;
-      state.meta = {
-        attendantId: null,
-        fromPhone: webhookData.fromPhone,
-        fromName: webhookData.fromName,
-        clientName: webhookData.fromName,
-        link: `https://app-utalk.umbler.com/chats/${conversationId}`,
-        sector: webhookData.sector
+      const state = {
+        lastInboundAt: now,
+        lastOutboundAt: null,
+        alertedAt: null,
+        meta: {
+          conversationId,
+          attendantId: null,
+          fromPhone: webhookData.fromPhone,
+          fromName: webhookData.fromName,
+          clientName: webhookData.fromName,
+          link: `https://app-utalk.umbler.com/chats/${conversationId}`,
+          sector: webhookData.sector
+        }
       };
       
       conversations.set(key, state);
       
       res.json({
         success: true,
-        message: 'Client message simulated successfully',
-        data: { key, webhookData, state }
+        message: 'Mensagem de cliente simulada com sucesso',
+        data: { key, webhookData, state },
+        instructions: [
+          `Timer de ${IDLE_MS/60000} minutos iniciado`,
+          'Aguarde o tempo configurado ou force sweep via POST /api/webhook/utalk/sweep',
+          'Verifique estado via GET /api/webhook/utalk/debug'
+        ]
       });
     } else {
       res.status(400).json({
         success: false,
-        error: 'Failed to process simulated webhook',
+        error: 'Falha ao processar webhook simulado',
         webhookData
       });
     }
@@ -701,12 +751,16 @@ app.post('/api/test/simulate-client-message', async (req, res) => {
   }
 });
 
-// Test endpoint to simulate attendant reply (outbound)
+// Simular resposta de atendente
 app.post('/api/test/simulate-attendant-reply', async (req, res) => {
   try {
-    const { conversationId = 'TEST_CONV_CLIENT', attendantId = 'aGevxChnIrrCytFy', clientPhone = '5511999999999', clientName = 'Cliente Teste' } = req.body;
+    const {
+      conversationId = 'TEST_CONV_CLIENT',
+      attendantId = 'aGevxChnIrrCytFy',
+      clientPhone = '5511999999999',
+      clientName = 'Cliente Teste'
+    } = req.body;
     
-    // Simulate UTalk webhook for attendant reply
     const simulatedWebhook = {
       Type: 'Message',
       Payload: {
@@ -719,7 +773,7 @@ app.post('/api/test/simulate-attendant-reply', async (req, res) => {
           },
           LastMessage: {
             Source: 'Member',
-            Text: 'Olá! Como posso ajudar?',
+            Text: 'Olá! Como posso ajudar você?',
             Chat: { Id: conversationId },
             SentByOrganizationMember: { Id: attendantId }
           }
@@ -727,13 +781,17 @@ app.post('/api/test/simulate-attendant-reply', async (req, res) => {
       }
     };
     
-    // Process the webhook
     const webhookData = extractWebhookData(simulatedWebhook);
     const key = webhookData.conversationId || webhookData.fromPhone;
     
     if (key && webhookData.direction === 'out') {
       const now = Date.now();
-      const state = conversations.get(key) || { lastInboundAt: null, lastOutboundAt: null, alertedAt: null, meta: {} };
+      const state = conversations.get(key) || {
+        lastInboundAt: null,
+        lastOutboundAt: null,
+        alertedAt: null,
+        meta: {}
+      };
       
       state.lastOutboundAt = now;
       state.meta = {
@@ -746,13 +804,14 @@ app.post('/api/test/simulate-attendant-reply', async (req, res) => {
       
       res.json({
         success: true,
-        message: 'Attendant reply simulated successfully',
-        data: { key, webhookData, state }
+        message: 'Resposta de atendente simulada com sucesso',
+        data: { key, webhookData, state },
+        result: 'Timer cancelado - não será enviado alerta'
       });
     } else {
       res.status(400).json({
         success: false,
-        error: 'Failed to process simulated webhook',
+        error: 'Falha ao processar webhook simulado',
         webhookData
       });
     }
@@ -761,72 +820,9 @@ app.post('/api/test/simulate-attendant-reply', async (req, res) => {
   }
 });
 
-// Test endpoint for complete flow
-app.post('/api/test/complete-flow', async (req, res) => {
-  try {
-    const conversationId = `TEST_FLOW_${Date.now()}`;
-    const clientPhone = '5511999999999';
-    const clientName = 'Cliente Teste Completo';
-    
-    // Step 1: Simulate client message
-    const clientWebhook = {
-      Type: 'Message',
-      Payload: {
-        Type: 'Chat',
-        Content: {
-          Id: conversationId,
-          Contact: { PhoneNumber: clientPhone, Name: clientName },
-          LastMessage: {
-            Source: 'Contact',
-            Text: 'Preciso de ajuda urgente!',
-            Chat: { Id: conversationId }
-          }
-        }
-      }
-    };
-    
-    const clientData = extractWebhookData(clientWebhook);
-    const key = clientData.conversationId;
-    
-    // Process client message
-    const now = Date.now();
-    const state = {
-      lastInboundAt: now,
-      lastOutboundAt: null,
-      alertedAt: null,
-      meta: {
-        attendantId: null,
-        fromPhone: clientData.fromPhone,
-        fromName: clientData.fromName,
-        clientName: clientData.fromName,
-        link: `https://app-utalk.umbler.com/chats/${conversationId}`,
-        sector: 'Geral'
-      }
-    };
-    
-    conversations.set(key, state);
-    
-    res.json({
-      success: true,
-      message: 'Complete test flow initiated',
-      data: {
-        conversationId,
-        key,
-        state,
-        instructions: [
-          'Client message has been simulated',
-          `Wait ${IDLE_MS / 60000} minutes for automatic alert`,
-          'Or call POST /api/webhook/utalk/sweep to force check',
-          'Check debug endpoint for conversation state'
-        ]
-      }
-    });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
+// ===== OUTROS ENDPOINTS =====
 
-// API endpoint to send message
+// Enviar mensagem
 app.post('/api/send-message', async (req, res) => {
   try {
     const { 
@@ -845,7 +841,6 @@ app.post('/api/send-message', async (req, res) => {
       idleTime
     } = req.body;
 
-    // Validate input
     if (!phoneNumber || !message) {
       return res.status(400).json({
         success: false,
@@ -853,7 +848,6 @@ app.post('/api/send-message', async (req, res) => {
       });
     }
 
-    // Clean phone number
     const cleanPhoneNumber = phoneNumber.replace(/\D/g, '');
     if (cleanPhoneNumber.length < 8 || cleanPhoneNumber.length > 15 || cleanPhoneNumber.startsWith('0')) {
       return res.status(400).json({
@@ -872,7 +866,6 @@ app.post('/api/send-message', async (req, res) => {
       });
     }
 
-    // Format message if organized or business format is requested
     let finalMessage = message;
     if (useOrganizedFormat === 'true') {
       finalMessage = api.formatOrganizedNotification({
@@ -881,24 +874,16 @@ app.post('/api/send-message', async (req, res) => {
         idleTime,
         link
       });
-    } else 
-    if (useBusinessFormat === 'true') {
+    } else if (useBusinessFormat === 'true') {
       finalMessage = api.formatBusinessMessage(message, attendantName, location, schedule, link);
     }
+
     let result;
 
     if (messageType === 'template' && templateName) {
-      // Send template message
       const templateParams = parameters ? parameters.split(',').map(p => p.trim()) : [];
       result = await api.sendTemplateMessage(channelId, cleanPhoneNumber, templateName, templateParams, organizationId);
     } else {
-      // Send simple message
-      console.log('Sending message with params:', {
-        channelId,
-        cleanPhoneNumber,
-        finalMessage,
-        organizationId
-      });
       result = await api.sendMessage(channelId, cleanPhoneNumber, finalMessage, organizationId);
     }
 
@@ -918,7 +903,7 @@ app.post('/api/send-message', async (req, res) => {
   }
 });
 
-// API endpoint to list channels
+// Listar canais
 app.get('/api/channels', async (req, res) => {
   try {
     const channels = await api.getChannels();
@@ -934,7 +919,7 @@ app.get('/api/channels', async (req, res) => {
   }
 });
 
-// API endpoint to create channel
+// Criar canal
 app.post('/api/create-channel', async (req, res) => {
   try {
     const { name, type } = req.body;
@@ -974,7 +959,7 @@ app.post('/api/create-channel', async (req, res) => {
   }
 });
 
-// Error handling middleware
+// Middleware de tratamento de erros
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
   res.status(500).json({
@@ -983,43 +968,56 @@ app.use((err, req, res, next) => {
   });
 });
 
-// Start server
+// ===== INICIALIZAÇÃO DO SERVIDOR =====
 app.listen(PORT, () => {
   console.log(`🚀 WhatsApp UTalk Bot Server running on http://localhost:${PORT}`);
   console.log('\n📋 Available endpoints:');
   console.log('   GET  /               - Web interface');
   console.log('   GET  /api/info       - Account information');
   console.log('   POST /api/send-message - Send WhatsApp message');
-  console.log('   GET  /api/channels   - List channels');
-  console.log('   POST /api/create-channel - Create new channel');
   console.log('   POST /api/webhook/utalk - UTalk webhook endpoint');
   console.log('   GET  /api/webhook/utalk/debug - Debug webhook state');
+  console.log('   POST /api/webhook/utalk/sweep - Force alert check');
   console.log('\n📱 Configuration:');
   console.log(`   Organization ID: ${process.env.ORGANIZATION_ID || 'Not set'}`);
   console.log(`   Channel ID: ${process.env.CHANNEL_ID || 'Not set'}`);
-  console.log(`   Manager Phone: ${MANAGER_PHONE || 'Not set'}`);
+  console.log(`   Alert Chat ID: ${ALERT_CHAT_ID || 'Not set'}`);
   console.log(`   Idle Time: ${IDLE_MS / 60000} minutes`);
+  console.log(`   Business Hours: ${BUSINESS_START_HOUR}:00 - ${BUSINESS_END_HOUR}:00`);
+  console.log(`   Max Alert Time: ${MAX_IDLE_ALERT_MINUTES} minutes`);
+  
+  if (!ALERT_CHAT_ID) {
+    console.log('\n⚠️  WARNING: ALERT_CHAT_ID not configured!');
+    console.log('   Alerts will use fallback methods only.');
+  }
+  
   console.log('\n💡 Run "npm run setup" if configuration is missing');
   
-  // Start automatic alert checking (important for serverless environments)
+  // Inicia verificador automático de alertas
   startAlertChecker();
 });
 
-// Automatic alert checker for serverless environments
+// ===== VERIFICADOR AUTOMÁTICO DE ALERTAS =====
 function startAlertChecker() {
-  const CHECK_INTERVAL = 60000; // Check every minute
+  const CHECK_INTERVAL = 60000; // Verifica a cada minuto
   
   console.log('🔄 Starting automatic alert checker...');
   
   setInterval(async () => {
     try {
-      await maybeSendDueAlerts(Date.now());
+      // Só verifica se estamos no horário comercial
+      if (isWithinBusinessHours(Date.now())) {
+        const alertsSent = await checkAndSendDueAlerts(Date.now());
+        if (alertsSent > 0) {
+          console.log(`✅ Alert check completed - ${alertsSent} alerts sent`);
+        }
+      }
     } catch (error) {
       console.error('Alert checker error:', error.message);
     }
   }, CHECK_INTERVAL);
   
-  console.log(`✅ Alert checker started (interval: ${CHECK_INTERVAL / 1000}s)`);
+  console.log(`✅ Alert checker started (interval: ${CHECK_INTERVAL / 1000}s, business hours only)`);
 }
 
 module.exports = app;
