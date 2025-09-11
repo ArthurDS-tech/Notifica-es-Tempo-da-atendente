@@ -169,7 +169,36 @@ class UTalkAPI {
     }
   }
 
-  // ===== NOVO MÉTODO: Enviar mensagem para chat específico =====
+  // ===== NOVO MÉTODO: Enviar mensagem para usuário específico =====
+  async sendMessageToUser(userId, message, organizationId) {
+    try {
+      if (!userId || !message || !organizationId) {
+        throw new Error('userId, message and organizationId are required');
+      }
+
+      console.log(`Enviando mensagem para usuário ${userId}`);
+
+      const userPayload = {
+        UserId: userId,
+        OrganizationId: organizationId,
+        Message: message.trim(),
+        MessageType: 'Text'
+      };
+
+      const response = await this.client.post('/v1/users/send-message/', userPayload, {
+        headers: { 'Content-Type': 'application/json' }
+      });
+      
+      console.log(`✅ Mensagem enviada para usuário ${userId}`);
+      return response.data;
+      
+    } catch (error) {
+      console.error(`❌ Falha ao enviar mensagem para usuário ${userId}:`, error.message);
+      throw new Error(`Failed to send message to user ${userId}: ${error.message}`);
+    }
+  }
+
+  // ===== MÉTODO: Enviar mensagem para chat específico =====
   async sendMessageToChat(chatId, message, organizationId) {
     try {
       // Validate required parameters
@@ -365,6 +394,30 @@ class UTalkAPI {
     lines.push('⚠️ *Ação necessária:* Verificar e responder ao cliente');
     lines.push('');
     lines.push('_Alerta automático do sistema UTalk Bot_');
+    
+    return lines.join('\n');
+  }
+
+  // ===== MÉTODO PARA FORMATAÇÃO DE ALERTA DE CLIENTE NÃO ATENDIDO =====
+  formatUnattendedClientAlert({ clientName, conversationId, attendantName, sector, idleMinutes, link, timestamp }) {
+    const lines = [];
+    lines.push('🚨 *CLIENTE NÃO ATENDIDO*');
+    lines.push('');
+    lines.push(`👤 *Cliente:* ${clientName || 'Nome não informado'}`);
+    lines.push(`💬 *Chat ID:* ${conversationId || 'Não disponível'}`);
+    lines.push(`🧑💼 *Último atendente:* ${attendantName || 'Não definido'}`);
+    lines.push(`📍 *Setor:* ${sector || 'Geral'}`);
+    lines.push(`⏱️ *Tempo aguardando:* ${idleMinutes} minutos`);
+    
+    if (link) {
+      lines.push(`🔗 *Link:* ${link}`);
+    }
+    
+    lines.push(`📅 *Data/Hora:* ${timestamp || new Date().toLocaleString('pt-BR')}`);
+    lines.push('');
+    lines.push('⚠️ *Cliente ainda não recebeu atendimento humano após mensagens automáticas*');
+    lines.push('');
+    lines.push('_Notificação automática do sistema UTalk Bot_');
     
     return lines.join('\n');
   }

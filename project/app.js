@@ -7,18 +7,32 @@ const { getAttendantNameById } = require('./config/attendants');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ===== CONFIGURAÇÃO DO CHAT DE ALERTAS =====
+// ===== CONFIGURAÇÃO DO SISTEMA DE MONITORAMENTO =====
 const ALERT_CHAT_ID = process.env.ALERT_CHAT_ID || 'aLrR-GU3ZQBaslwU';
-const MANAGER_PHONE = process.env.MANAGER_PHONE; // fallback apenas
+const MANAGER_PHONE = process.env.MANAGER_PHONE;
 const MANAGER_ATTENDANT_ID = process.env.MANAGER_ATTENDANT_ID;
 const WEBHOOK_DEBUG = (process.env.WEBHOOK_DEBUG || 'true') === 'true';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
+// MONITORA TODOS OS CHATS - NÃO APENAS UM ESPECÍFICO
+const MONITOR_ALL_CHATS = true;
+
 // Configurações de tempo
 const IDLE_MS = Number(process.env.IDLE_MS || 15 * 60 * 1000); // 15 minutos padrão
 const MAX_IDLE_ALERT_MINUTES = Number(process.env.MAX_IDLE_ALERT_MINUTES || 60); // 60 min máx
-const BUSINESS_START_HOUR = Number(process.env.BUSINESS_START_HOUR || 9); // 09:00
-const BUSINESS_END_HOUR = Number(process.env.BUSINESS_END_HOUR || 17); // 17:00
+const BUSINESS_START_HOUR = Number(process.env.BUSINESS_START_HOUR || 8); // 08:00
+const BUSINESS_END_HOUR = Number(process.env.BUSINESS_END_HOUR || 18); // 18:00
+
+// Palavras que indicam fim de conversa (cliente não precisa de resposta)
+const CONVERSATION_ENDERS = [
+  /^(ok|okay|blz|beleza|obrigad[oa]|valeu|tchau|bye|flw|falou)$/i,
+  /^(entendi|perfeito|certo|show|top|legal|massa)$/i,
+  /^(👍|👌|✅|😊|😉|🙏)$/,
+  /^(obrigad[oa]\s*(mesmo|demais)?[!.]*)$/i
+];
+
+// Tags que indicam conversa interna (atendente com atendente)
+const INTERNAL_TAGS = ['interno', 'internal', 'staff', 'equipe', 'atendente'];
 
 // Middleware
 app.use(bodyParser.json());
@@ -42,10 +56,13 @@ try {
 }
 
 // ===== SISTEMA DE MONITORAMENTO DE CONVERSAS =====
-const conversations = new Map(); // key -> { lastInboundAt, lastOutboundAt, alertedAt, meta }
+const conversations = new Map(); // key -> { lastInboundAt, lastOutboundAt, alertedAt, meta, webhookHistory }
 const recentWebhookEvents = [];
 const recentWebhookSkips = [];
 const MAX_RECENT_EVENTS = 200;
+
+// ID do chat da gestora
+const MANAGER_ID = process.env.MANAGER_ID || 'aLrR-GU3ZQBaslwU';
 
 // Estatísticas de alertas
 const alertStats = {
@@ -190,6 +207,135 @@ async function sendAlertFallback(conversationData) {
   }
 }
 
+// ===== LIMPEZA DE CONVERSAS ANTIGAS =====
+
+// Limpa conversas antigas (após 6 horas de inatividade)
+function cleanOldConversations() {
+  const now = Date.now();
+  const SIX_HOURS = 6 * 60 * 60 * 1000; // 6 horas em ms
+  let cleaned = 0;
+  
+  for (const [key, state] of conversations.entries()) {
+    const lastActivity = Math.max(
+      state.lastInboundAt || 0,
+      state.lastOutboundAt || 0,
+      state.alertedAt || 0
+    );
+    
+    // Remove apenas se passou 6 horas da última atividade
+    if (lastActivity && (now - lastActivity) > SIX_HOURS) {
+      conversations.delete(key);
+      cleaned++;
+    }
+  }
+  
+  if (cleaned > 0) {
+    console.log(`🧹 Limpeza automática: ${cleaned} conversas antigas removidas (>6h)`);
+  }
+}
+
+// ===== ANÁLISE DE ATENDIMENTO HUMANO =====
+
+// Verifica se mensagem é automática (bot)
+function isAutomaticMessage(messageText, attendantId) {
+  if (!messageText) return false;
+  
+  // Mensagens típicas de bot/automação
+  const botPatterns = [
+    /olá.*bem.*vindo/i,
+    /como.*posso.*ajudar/i,
+    /digite.*opção/i,
+    /selecione.*uma.*opção/i,
+    /menu.*principal/i,
+    /atendimento.*automático/i,
+    /bot.*atendimento/i,
+    /^\d+\s*-/,  // Opções numeradas
+    /para.*falar.*atendente/i,
+    /horário.*funcionamento/i
+  ];
+  
+  return botPatterns.some(pattern => pattern.test(messageText));
+}
+
+// Verifica se mensagem indica fim de conversa
+function isConversationEnder(messageText) {
+  if (!messageText) return false;
+  
+  const cleanText = messageText.trim();
+  return CONVERSATION_ENDERS.some(pattern => pattern.test(cleanText));
+}
+
+// Verifica se conversa está em horário de atendimento
+function isInBusinessHours(timestamp) {
+  const date = new Date(timestamp);
+  const hour = date.getHours();
+  const day = date.getDay(); // 0=Dom, 6=Sáb
+  
+  // Segunda a sexta, 8h às 18h
+  return day >= 1 && day <= 5 && hour >= BUSINESS_START_HOUR && hour < BUSINESS_END_HOUR;
+}
+
+// Analisa histórico de webhooks para determinar se houve atendimento humano
+function analyzeConversationForHumanAttendant(webhookHistory) {
+  if (!webhookHistory || webhookHistory.length === 0) return false;
+  
+  // Procura por mensagens de saída (atendente) que não sejam bot
+  const humanMessages = webhookHistory.filter(event => 
+    event.direction === 'out' && 
+    !event.isBot && 
+    event.attendantId && 
+    event.attendantId !== MANAGER_ID // Exclui mensagens da gestora
+  );
+  
+  return humanMessages.length > 0;
+}
+
+// Envia notificação para gestora via WhatsApp
+async function notifyManagerAboutUnattendedClient(conversationData) {
+  const organizationId = process.env.ORGANIZATION_ID;
+  const channelId = process.env.CHANNEL_ID;
+  const managerPhone = process.env.MANAGER_PHONE;
+  
+  if (!managerPhone) {
+    console.warn('MANAGER_PHONE não configurado');
+    return { success: false, error: 'Manager phone not configured' };
+  }
+
+  const { key, clientName, attendantName, idleMinutes, link, sector, conversationId } = conversationData;
+  
+  // Busca nome do atendente responsável
+  const attendantFullName = getAttendantNameById(conversationData.attendantId) || attendantName || 'Sistema Automático';
+  
+  // Mensagem formatada para WhatsApp
+  const managerMessage = `🚨 *CLIENTE NÃO ATENDIDO*
+
+👤 *Cliente:* ${clientName || 'Nome não informado'}
+💬 *Chat ID:* ${conversationId || key}
+🧑💼 *Atendente Responsável:* ${attendantFullName}
+📍 *Setor:* ${sector || 'Geral'}
+⏱️ *Tempo aguardando:* ${idleMinutes} minutos (horário comercial)
+🔗 *Link:* ${link || 'Não disponível'}
+📅 *Data/Hora:* ${new Date().toLocaleString('pt-BR')}
+
+⚠️ *Cliente aguarda atendimento humano há ${idleMinutes} minutos*
+
+_Alerta automático - Horário: 8h-18h_`;
+
+  try {
+    console.log(`[${key}] Enviando para WhatsApp ${managerPhone}`);
+    
+    // Envia via WhatsApp para o telefone da gestora
+    const result = await api.sendMessage(channelId, managerPhone, managerMessage, organizationId);
+    
+    console.log(`[${key}] ✅ Gestora notificada via WhatsApp`);
+    return { success: true, target: 'whatsapp', result };
+    
+  } catch (error) {
+    console.error(`[${key}] ❌ Erro ao notificar gestora:`, error.message);
+    return { success: false, error: error.message };
+  }
+}
+
 // ===== VERIFICAÇÃO DE ALERTAS DEVIDOS =====
 async function checkAndSendDueAlerts(now = Date.now()) {
   if (!ALERT_CHAT_ID && !MANAGER_PHONE) {
@@ -198,10 +344,12 @@ async function checkAndSendDueAlerts(now = Date.now()) {
   }
   
   console.log('=== VERIFICANDO ALERTAS DEVIDOS ===');
+  console.log('=== MONITORAMENTO GLOBAL DE TODOS OS CHATS ===');
   console.log('Total conversas monitoradas:', conversations.size);
   console.log('Horário atual:', new Date(now).toLocaleString('pt-BR'));
   console.log('Dentro do horário comercial:', isWithinBusinessHours(now));
-  console.log('Chat de alertas:', ALERT_CHAT_ID);
+  console.log('Monitora todos os chats:', MONITOR_ALL_CHATS);
+  console.log('Gestora (Manager ID):', MANAGER_ID);
   
   let alertsSent = 0;
   
@@ -232,37 +380,47 @@ async function checkAndSendDueAlerts(now = Date.now()) {
       attendantName: meta.attendantName
     });
     
+    // Verifica se cliente foi atendido por humano
+    const hasHumanAttendant = analyzeConversationForHumanAttendant(state.webhookHistory || []);
+    
     // Condições para enviar alerta:
-    // 1. Não foi respondida pelo atendente
+    // 1. Cliente ainda não foi atendido por humano
     // 2. Tempo de inatividade >= IDLE_MS
     // 3. Não foi enviado alerta ainda
     // 4. Não passou do tempo máximo
     // 5. Está dentro do horário comercial
-    if (!replied && overdue && !alreadyAlerted && !overCap && withinBusinessHours) {
+    if (!hasHumanAttendant && overdue && !alreadyAlerted && !overCap && withinBusinessHours) {
       console.log(`[${key}] 🚨 ENVIANDO ALERTA - Todas condições atendidas`);
       
       const conversationData = {
         key,
+        conversationId: meta.conversationId || key,
         clientName: meta.clientName || meta.fromName || meta.fromPhone || 'Cliente',
-        attendantName: meta.attendantName || getAttendantNameById(meta.attendantId) || 'Atendente',
+        attendantId: meta.attendantId,
+        attendantName: meta.attendantName || getAttendantNameById(meta.attendantId) || 'Sistema',
         idleMinutes,
         link: meta.link || `https://app-utalk.umbler.com/chats/${meta.conversationId || key}`,
-        sector: meta.sector || 'Geral'
+        sector: meta.sector || 'Geral',
+        tags: meta.tags || []
       };
       
-      const result = await sendAlertToChat(conversationData);
+      // 1. ENVIA PARA WHATSAPP DA GESTORA
+      const whatsappResult = await notifyManagerAboutUnattendedClient(conversationData);
       
-      if (result.success) {
+      // 2. ENVIA WEBHOOK PARA APLICAÇÃO TERCEIRA
+      const webhookResult = await notifyThirdPartyWebhook(conversationData);
+      
+      if (whatsappResult.success || webhookResult.success) {
         state.alertedAt = now;
         alertsSent++;
-        console.log(`[${key}] ✅ Alerta enviado com sucesso via ${result.target}`);
+        console.log(`[${key}] ✅ Notificações enviadas - WhatsApp: ${whatsappResult.success}, Webhook: ${webhookResult.success}`);
       } else {
-        console.error(`[${key}] ❌ Falha ao enviar alerta:`, result.error);
+        console.error(`[${key}] ❌ Ambas notificações falharam`);
       }
     } else {
       // Log do motivo de não enviar
       const reasons = [];
-      if (replied) reasons.push('já_respondida');
+      if (hasHumanAttendant) reasons.push('já_atendido_por_humano');
       if (!overdue) reasons.push('não_expirada');
       if (alreadyAlerted) reasons.push('já_alertada');
       if (overCap) reasons.push('tempo_excedido');
@@ -327,19 +485,51 @@ app.get('/api/channel-status/:channelId', async (req, res) => {
   }
 });
 
-// ===== WEBHOOK PRINCIPAL =====
+// ===== WEBHOOK PRINCIPAL (UMBLER TALK 2.0) =====
 app.post('/api/webhook/utalk', async (req, res) => {
+  const startTime = Date.now();
+  
   try {
+    // RESPOSTA RÁPIDA CONFORME UMBLER (< 5 segundos)
+    res.status(200).json({ received: true, eventId: req.body?.EventId });
+    
     const event = req.body || {};
+    const attempt = req.headers['x-attempt'] || '1';
     
     if (WEBHOOK_DEBUG) {
-      console.log('=== WEBHOOK RECEBIDO ===');
-      console.log('Timestamp:', new Date().toISOString());
-      console.log('Event:', JSON.stringify(event, null, 2));
-      console.log('=========================');
+      console.log('=== WEBHOOK UMBLER RECEBIDO ===');
+      console.log('EventId:', event.EventId);
+      console.log('Type:', event.Type);
+      console.log('Attempt:', attempt);
+      console.log('EventDate:', event.EventDate);
+      console.log('Payload Type:', event.Payload?.Type);
+      console.log('===============================');
     }
 
-    const webhookData = extractWebhookData(event);
+    // Processa apenas eventos de Message
+    if (event.Type !== 'Message') {
+      if (WEBHOOK_DEBUG) console.log('Ignorando evento não-Message:', event.Type);
+      return;
+    }
+
+    const webhookData = extractUmblerWebhookData(event);
+    
+    if (!webhookData) {
+      if (WEBHOOK_DEBUG) console.log('Webhook inválido ou não-chat');
+      return;
+    }
+    
+    // Ignora mensagens privadas (notas internas)
+    if (webhookData.isPrivate) {
+      if (WEBHOOK_DEBUG) console.log('Ignorando nota interna');
+      return;
+    }
+    
+    // Ignora conversas internas (atendente com atendente)
+    if (webhookData.isInternal) {
+      if (WEBHOOK_DEBUG) console.log('Ignorando conversa interna (atendente com atendente)');
+      return;
+    }
     
     if (WEBHOOK_DEBUG) {
       console.log('=== DADOS EXTRAÍDOS ===');
@@ -352,40 +542,89 @@ app.post('/api/webhook/utalk', async (req, res) => {
     // Link da conversa
     const conversationLink = conversationId ? `https://app-utalk.umbler.com/chats/${conversationId}` : null;
 
-    // Chave para rastreamento (prioridade: conversationId > fromPhone)
-    const key = conversationId || fromPhone;
+    // Chave para rastreamento - SEMPRE aceita qualquer chat
+    const key = conversationId || fromPhone || `UNKNOWN_${Date.now()}`;
 
     // Registra evento para debug
     if (WEBHOOK_DEBUG) {
       recentWebhookEvents.unshift({
+        eventId: webhookData.eventId,
+        eventDate: webhookData.eventDate,
         ts: new Date().toISOString(),
-        type: event.type || event.Type || 'unknown',
-        direction,
-        conversationId,
-        fromPhone,
-        fromName,
-        attendantId,
-        attendantName: getAttendantNameById(attendantId) || null,
-        sector,
-        messageText: messageText ? messageText.substring(0, 100) : null
+        type: event.Type,
+        direction: webhookData.direction,
+        conversationId: webhookData.conversationId,
+        fromPhone: webhookData.fromPhone,
+        fromName: webhookData.fromName,
+        attendantId: webhookData.attendantId,
+        attendantName: getAttendantNameById(webhookData.attendantId) || null,
+        sector: webhookData.sector,
+        messageText: webhookData.messageText ? webhookData.messageText.substring(0, 100) : null,
+        isPrivate: webhookData.isPrivate
       });
       if (recentWebhookEvents.length > MAX_RECENT_EVENTS) {
         recentWebhookEvents.pop();
       }
     }
 
-    // Atualiza estado da conversa
-    if (key && direction) {
+    // ACEITA TODOS OS WEBHOOKS - Mesmo sem direção clara
+    if (key && MONITOR_ALL_CHATS) {
+      // Se não tem direção, tenta inferir
+      if (!direction) {
+        if (attendantId) {
+          direction = 'out';
+        } else if (fromPhone) {
+          direction = 'in';
+        } else {
+          direction = 'in'; // Padrão
+        }
+        console.log(`[${key}] 🔍 Direção inferida: ${direction}`);
+      }
       const now = Date.now();
       const state = conversations.get(key) || {
         lastInboundAt: null,
         lastOutboundAt: null,
         alertedAt: null,
-        meta: {}
+        meta: {},
+        webhookHistory: []
       };
       
+      // Adiciona evento ao histórico de webhooks
+      state.webhookHistory.push({
+        timestamp: now,
+        direction,
+        attendantId,
+        attendantName: getAttendantNameById(attendantId),
+        messageText: messageText ? messageText.substring(0, 100) : null,
+        isBot: isAutomaticMessage(messageText, attendantId)
+      });
+      
+      // Mantém apenas os últimos 50 eventos
+      if (state.webhookHistory.length > 50) {
+        state.webhookHistory = state.webhookHistory.slice(-50);
+      }
+      
+      // Limpa conversas antigas apenas após 6 horas
+      cleanOldConversations();
+      
       if (direction === 'in') {
-        console.log(`[${key}] 📨 MENSAGEM DO CLIENTE - Iniciando monitoramento`);
+        // Verifica se é mensagem de fim de conversa
+        const isEnding = isConversationEnder(messageText);
+        
+        if (isEnding) {
+          console.log(`[${key}] 👋 MENSAGEM DE DESPEDIDA - Não precisa resposta: "${messageText}"`);
+          // Remove da lista de monitoramento
+          conversations.delete(key);
+          return;
+        }
+        
+        // Verifica se está no horário de atendimento
+        if (!isInBusinessHours(now)) {
+          console.log(`[${key}] 🕰 FORA DO HORÁRIO - Não monitora (8h-18h)`);
+          return;
+        }
+        
+        console.log(`[${key}] 📨 MENSAGEM DO CLIENTE - Analisando atendimento`);
         state.lastInboundAt = now;
         state.alertedAt = null; // Reset alerta em nova mensagem do cliente
         state.meta = {
@@ -396,14 +635,29 @@ app.post('/api/webhook/utalk', async (req, res) => {
           clientName: fromName,
           link: conversationLink,
           sector: sector || 'Geral',
-          lastMessageText: messageText
+          lastMessageText: messageText,
+          tags: webhookData.tags || []
         };
         
-        console.log(`[${key}] ⏰ Timer de ${IDLE_MS/60000} minutos iniciado`);
+        // Analisa se cliente já foi atendido por humano
+        const hasHumanAttendant = analyzeConversationForHumanAttendant(state.webhookHistory);
+        
+        if (hasHumanAttendant) {
+          console.log(`[${key}] ✅ Cliente já foi atendido por humano - não monitora`);
+        } else {
+          console.log(`[${key}] ⏰ Cliente ainda não foi atendido - iniciando monitoramento`);
+        }
         
       } else if (direction === 'out') {
-        console.log(`[${key}] 📤 RESPOSTA DO ATENDENTE - Cancelando timer`);
-        state.lastOutboundAt = now;
+        const isBot = isAutomaticMessage(messageText, attendantId);
+        
+        if (isBot) {
+          console.log(`[${key}] 🤖 MENSAGEM AUTOMÁTICA - Continua monitoramento`);
+        } else {
+          console.log(`[${key}] 👤 RESPOSTA HUMANA - Cancelando timer`);
+          state.lastOutboundAt = now;
+        }
+        
         // Mantém informações do cliente, atualiza atendente
         state.meta = {
           ...state.meta,
@@ -411,53 +665,60 @@ app.post('/api/webhook/utalk', async (req, res) => {
           attendantName: getAttendantNameById(attendantId),
           lastMessageText: messageText
         };
-        
-        // Se havia timer ativo, cancela
-        const timeSinceInbound = state.lastInboundAt ? now - state.lastInboundAt : 0;
-        console.log(`[${key}] ✅ Timer cancelado após ${Math.round(timeSinceInbound/60000)} minutos`);
       }
       
       conversations.set(key, state);
       
       // Log resumido do estado
       console.log(`[${key}] Estado atualizado:`, {
-        hasInbound: Boolean(state.lastInboundAt),
+          hasInbound: Boolean(state.lastInboundAt),
         hasOutbound: Boolean(state.lastOutboundAt),
-        needsAlert: state.lastInboundAt && (!state.lastOutboundAt || state.lastOutboundAt < state.lastInboundAt) && !state.alertedAt,
+        hasHumanAttendant: analyzeConversationForHumanAttendant(state.webhookHistory || []),
+        webhookCount: (state.webhookHistory || []).length,
+        recentWebhooks: (state.webhookHistory || []).slice(-5).map(w => ({
+          timestamp: new Date(w.timestamp).toLocaleString('pt-BR'),
+          direction: w.direction,
+          attendantName: w.attendantName,
+          isBot: w.isBot,
+          messagePreview: w.messageText ? w.messageText.substring(0, 50) : null
+        })),
+        needsAlert: state.lastInboundAt && !analyzeConversationForHumanAttendant(state.webhookHistory || []) && !state.alertedAt,
         clientName: state.meta.clientName,
         attendantName: state.meta.attendantName,
         sector: state.meta.sector
       });
       
     } else {
-      // Registra pulos para debug
-      const reason = !key ? 'chave_ausente' : !direction ? 'direção_ausente' : 'outro';
-      recentWebhookSkips.unshift({
-        ts: new Date().toISOString(),
-        reason,
-        conversationId,
-        fromPhone,
-        event: JSON.stringify(event).substring(0, 200)
-      });
-      if (recentWebhookSkips.length > MAX_RECENT_EVENTS) {
-        recentWebhookSkips.pop();
-      }
+      // Log apenas para debug - Casos muito raros
+      const reason = !key ? 'chave_ausente' : 'monitoramento_desabilitado';
       
-      console.warn(`[WEBHOOK] ⚠️ Evento ignorado - ${reason}:`, {
-        key, direction, conversationId, fromPhone
-      });
+      if (WEBHOOK_DEBUG && !key) {
+        recentWebhookSkips.unshift({
+          ts: new Date().toISOString(),
+          reason,
+          conversationId,
+          fromPhone,
+          event: JSON.stringify(event).substring(0, 200)
+        });
+        if (recentWebhookSkips.length > MAX_RECENT_EVENTS) {
+          recentWebhookSkips.pop();
+        }
+        
+        console.warn(`[WEBHOOK] ⚠️ Evento ignorado - ${reason}:`, {
+          key, direction, conversationId, fromPhone
+        });
+      }
     }
 
-    res.json({ ok: true });
     
   } catch (error) {
     console.error('Erro no webhook:', error);
-    res.status(200).json({ ok: true }); // Sempre retorna OK para não quebrar UTalk
+    // Já respondeu no início, apenas loga o erro
   }
 });
 
-// Função para extrair dados do webhook
-function extractWebhookData(event) {
+// Função para extrair dados do webhook Umbler Talk 2.0
+function extractUmblerWebhookData(event) {
   let conversationId = null;
   let fromPhone = null;
   let fromName = null;
@@ -465,66 +726,49 @@ function extractWebhookData(event) {
   let direction = null;
   let messageText = null;
   let sector = 'Geral';
+  let isPrivate = false;
 
-  // Formato Chat snapshot (mais comum)
-  const payloadType = (event.Payload && event.Payload.Type) || (event.payload && event.payload.Type);
-  const content = (event.Payload && event.Payload.Content) || (event.payload && event.payload.Content);
+  // Estrutura padrão Umbler Talk 2.0
+  const payload = event.Payload;
+  if (!payload || payload.Type !== 'Chat') {
+    return null; // Não é um evento de chat válido
+  }
+
+  const content = payload.Content;
+  if (!content) return null;
+
+  const lastMessage = content.LastMessage || {};
   
-  if (payloadType === 'Chat' && content) {
-    const lastMessage = content.LastMessage || {};
-    
-    conversationId = content.Id || (lastMessage.Chat && lastMessage.Chat.Id);
-    fromPhone = (content.Contact && (content.Contact.PhoneNumber || content.Contact.Phone));
-    fromName = (content.Contact && content.Contact.Name);
-    messageText = lastMessage.Text || lastMessage.Content || lastMessage.MessageText;
-    
-    // Determina direção baseada na origem da mensagem
-    const messageSource = lastMessage.Source;
-    const sentByMember = lastMessage.SentByOrganizationMember;
-    
-    if (messageSource === 'Contact') {
-      direction = 'in';
-      attendantId = null;
-    } else if (messageSource === 'Member' && sentByMember && sentByMember.Id) {
-      direction = 'out';
-      attendantId = sentByMember.Id;
-    }
-    
-    // Extrai setor
-    sector = extractSectorFromEvent(event, content) || 'Geral';
-    
+  // Dados básicos do chat
+  conversationId = content.Id;
+  fromPhone = content.Contact?.PhoneNumber || content.Contact?.Phone;
+  fromName = content.Contact?.Name;
+  sector = content.Sector?.Name || 'Geral';
+  
+  // Extrai tags/etiquetas
+  const tags = content.Tags || [];
+  const tagNames = tags.map(tag => (tag.Name || tag.name || '').toLowerCase());
+  const isInternal = tagNames.some(tag => INTERNAL_TAGS.includes(tag));
+  
+  // Dados da mensagem
+  messageText = lastMessage.Content || lastMessage.Text;
+  isPrivate = lastMessage.IsPrivate || false;
+  
+  // Determina direção baseada na origem (padrão Umbler)
+  const messageSource = lastMessage.Source;
+  
+  if (messageSource === 'Contact') {
+    direction = 'in';
+    attendantId = null;
+  } else if (messageSource === 'Member') {
+    direction = 'out';
+    attendantId = lastMessage.SentByOrganizationMember?.Id || null;
+  } else if (messageSource === 'Bot') {
+    direction = 'out';
+    attendantId = 'BOT_SYSTEM';
   } else {
-    // Formato direto de mensagem
-    const message = event.message || event.Message || event.payload || event.Payload || {};
-    
-    conversationId = event.conversationId || event.ConversationId || 
-                    message.conversationId || message.chatId || message.ticketId ||
-                    (message.Chat && message.Chat.Id);
-    
-    fromPhone = event.fromPhone || event.FromPhone ||
-                message.fromPhone || message.contactPhone ||
-                (message.from && (message.from.phone || message.from.phoneNumber));
-    
-    fromName = event.fromName || event.FromName ||
-               message.fromName || message.contactName ||
-               (message.from && message.from.name);
-    
-    attendantId = event.attendantId || event.AttendantId ||
-                  message.attendantId || message.agentId || 
-                  (message.SentByOrganizationMember && message.SentByOrganizationMember.Id);
-    
-    messageText = message.text || message.Text || message.content || message.Content || message.message;
-    
-    direction = message.direction || event.direction;
-    if (!direction) {
-      const type = event.type || event.Type || '';
-      if (type.includes('in') || type.includes('inbound')) direction = 'in';
-      else if (type.includes('out') || type.includes('outbound')) direction = 'out';
-      else if (attendantId) direction = 'out';
-      else direction = 'in'; // Assume entrada por padrão
-    }
-    
-    sector = extractSectorFromEvent(event, message) || 'Geral';
+    // Fallback
+    direction = attendantId ? 'out' : 'in';
   }
 
   // Normaliza telefone
@@ -540,11 +784,16 @@ function extractWebhookData(event) {
     attendantId,
     direction,
     messageText,
-    sector
+    sector,
+    isPrivate,
+    isInternal,
+    tags: tagNames,
+    eventId: event.EventId,
+    eventDate: event.EventDate
   };
 }
 
-// Extrai setor do evento
+// Extrai setor do evento - ACEITA QUALQUER SETOR
 function extractSectorFromEvent(event, message) {
   const tryValues = [
     event.sector, event.Sector, event.department, event.Department,
@@ -567,8 +816,9 @@ function extractSectorFromEvent(event, message) {
                        event.metadata.Sector || event.metadata.Department))
   ].filter(Boolean);
   
+  // ACEITA QUALQUER SETOR - não restringe
   if (tryValues.length > 0) return String(tryValues[0]).trim();
-  return 'Geral';
+  return 'Todos_os_Setores'; // Indica que monitora todos
 }
 
 // ===== ENDPOINTS DE DEBUG E ADMIN =====
@@ -758,8 +1008,13 @@ app.post('/api/test/simulate-attendant-reply', async (req, res) => {
       conversationId = 'TEST_CONV_CLIENT',
       attendantId = 'aGevxChnIrrCytFy',
       clientPhone = '5511999999999',
-      clientName = 'Cliente Teste'
+      clientName = 'Cliente Teste',
+      isBot = false
     } = req.body;
+    
+    const messageText = isBot ? 
+      'Olá! Bem-vindo ao nosso atendimento. Digite 1 para falar com atendente.' :
+      'Olá! Como posso ajudar você?';
     
     const simulatedWebhook = {
       Type: 'Message',
@@ -773,7 +1028,7 @@ app.post('/api/test/simulate-attendant-reply', async (req, res) => {
           },
           LastMessage: {
             Source: 'Member',
-            Text: 'Olá! Como posso ajudar você?',
+            Text: messageText,
             Chat: { Id: conversationId },
             SentByOrganizationMember: { Id: attendantId }
           }
@@ -790,10 +1045,24 @@ app.post('/api/test/simulate-attendant-reply', async (req, res) => {
         lastInboundAt: null,
         lastOutboundAt: null,
         alertedAt: null,
-        meta: {}
+        meta: {},
+        webhookHistory: []
       };
       
-      state.lastOutboundAt = now;
+      // Adiciona ao histórico
+      state.webhookHistory.push({
+        timestamp: now,
+        direction: 'out',
+        attendantId,
+        attendantName: getAttendantNameById(attendantId),
+        messageText,
+        isBot: isAutomaticMessage(messageText, attendantId)
+      });
+      
+      if (!isBot) {
+        state.lastOutboundAt = now;
+      }
+      
       state.meta = {
         ...state.meta,
         attendantId: webhookData.attendantId,
@@ -802,11 +1071,18 @@ app.post('/api/test/simulate-attendant-reply', async (req, res) => {
       
       conversations.set(key, state);
       
+      const hasHumanAttendant = analyzeConversationForHumanAttendant(state.webhookHistory);
+      
       res.json({
         success: true,
-        message: 'Resposta de atendente simulada com sucesso',
+        message: `${isBot ? 'Mensagem de bot' : 'Resposta humana'} simulada com sucesso`,
         data: { key, webhookData, state },
-        result: 'Timer cancelado - não será enviado alerta'
+        analysis: {
+          isBot: isAutomaticMessage(messageText, attendantId),
+          hasHumanAttendant,
+          webhookHistoryCount: state.webhookHistory.length
+        },
+        result: hasHumanAttendant ? 'Cliente foi atendido por humano' : 'Cliente ainda não foi atendido por humano'
       });
     } else {
       res.status(400).json({
@@ -819,6 +1095,180 @@ app.post('/api/test/simulate-attendant-reply', async (req, res) => {
     res.status(500).json({ success: false, error: e.message });
   }
 });
+
+// Testar notificação para gestora
+app.post('/api/test/notify-manager', async (req, res) => {
+  try {
+    const {
+      clientName = 'Cliente Teste',
+      conversationId = 'TEST_CONV_123',
+      attendantName = 'Atendente Teste',
+      sector = 'Geral',
+      idleMinutes = 20
+    } = req.body;
+    
+    const conversationData = {
+      key: conversationId,
+      clientName,
+      conversationId,
+      attendantName,
+      sector,
+      idleMinutes,
+      link: `https://app-utalk.umbler.com/chats/${conversationId}`
+    };
+    
+    const result = await notifyManagerAboutUnattendedClient(conversationData);
+    
+    res.json({
+      success: true,
+      message: 'Teste de notificação para gestora executado',
+      result,
+      managerId: MANAGER_ID,
+      conversationData
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Simular webhook real de qualquer chat
+app.post('/api/test/simulate-any-chat', async (req, res) => {
+  try {
+    const {
+      conversationId = `CHAT_${Date.now()}`,
+      clientPhone = `5548${Math.floor(Math.random() * 100000000)}`,
+      clientName = 'Cliente Real',
+      sector = 'Vendas',
+      messageText = 'Olá, preciso de ajuda!'
+    } = req.body;
+    
+    // Simula webhook real do UTalk
+    const realWebhook = {
+      Type: 'Message',
+      Payload: {
+        Type: 'Chat',
+        Content: {
+          Id: conversationId,
+          Contact: {
+            PhoneNumber: clientPhone,
+            Name: clientName
+          },
+          LastMessage: {
+            Source: 'Contact',
+            Text: messageText,
+            Chat: { Id: conversationId }
+          }
+        }
+      },
+      Sector: sector
+    };
+    
+    // Processa como webhook real
+    const webhookData = extractWebhookData(realWebhook);
+    const key = webhookData.conversationId || webhookData.fromPhone;
+    
+    if (key && webhookData.direction === 'in') {
+      const now = Date.now();
+      const state = {
+        lastInboundAt: now,
+        lastOutboundAt: null,
+        alertedAt: null,
+        meta: {
+          conversationId,
+          attendantId: null,
+          fromPhone: webhookData.fromPhone,
+          fromName: webhookData.fromName,
+          clientName: webhookData.fromName,
+          link: `https://app-utalk.umbler.com/chats/${conversationId}`,
+          sector: webhookData.sector
+        },
+        webhookHistory: [{
+          timestamp: now,
+          direction: 'in',
+          attendantId: null,
+          attendantName: null,
+          messageText,
+          isBot: false
+        }]
+      };
+      
+      conversations.set(key, state);
+      
+      res.json({
+        success: true,
+        message: 'Chat simulado e adicionado ao monitoramento global',
+        data: {
+          key,
+          conversationId,
+          clientName,
+          sector,
+          monitoringStarted: new Date(now).toLocaleString('pt-BR')
+        },
+        instructions: [
+          'Chat agora está sendo monitorado globalmente',
+          `Aguarde ${IDLE_MS/60000} minutos ou force sweep`,
+          'Gestora será notificada se não houver atendimento humano'
+        ]
+      });
+    } else {
+      res.status(400).json({
+        success: false,
+        error: 'Falha ao processar webhook simulado',
+        webhookData
+      });
+    }
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ===== NOTIFICAÇÃO PARA APLICAÇÕES TERCEIRAS =====
+
+// Envia webhook para aplicação terceira (Paola)
+async function notifyThirdPartyWebhook(alertData) {
+  const webhookUrl = process.env.MANAGER1_WEBHOOK;
+  
+  if (!webhookUrl) {
+    console.log('MANAGER1_WEBHOOK não configurado');
+    return { success: false, error: 'Webhook URL not configured' };
+  }
+
+  const webhookPayload = {
+    Type: 'ClientUnattended',
+    EventDate: new Date().toISOString(),
+    EventId: `ALERT_${Date.now()}`,
+    Payload: {
+      Type: 'Alert',
+      Content: {
+        ClientName: alertData.clientName,
+        ConversationId: alertData.conversationId || alertData.key,
+        AttendantName: alertData.attendantName,
+        Sector: alertData.sector,
+        IdleMinutes: alertData.idleMinutes,
+        Link: alertData.link,
+        Timestamp: new Date().toISOString()
+      }
+    }
+  };
+
+  try {
+    const axios = require('axios');
+    const response = await axios.post(webhookUrl, webhookPayload, {
+      timeout: 4000, // < 5 segundos conforme Umbler
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'UTalk-Bot-Webhook/1.0'
+      }
+    });
+    
+    console.log(`✅ Webhook terceiro enviado: ${response.status}`);
+    return { success: true, status: response.status };
+    
+  } catch (error) {
+    console.error(`❌ Erro webhook terceiro:`, error.message);
+    return { success: false, error: error.message };
+  }
+}
 
 // ===== OUTROS ENDPOINTS =====
 
@@ -978,17 +1428,19 @@ app.listen(PORT, () => {
   console.log('   POST /api/webhook/utalk - UTalk webhook endpoint');
   console.log('   GET  /api/webhook/utalk/debug - Debug webhook state');
   console.log('   POST /api/webhook/utalk/sweep - Force alert check');
-  console.log('\n📱 Configuration:');
-  console.log(`   Organization ID: ${process.env.ORGANIZATION_ID || 'Not set'}`);
-  console.log(`   Channel ID: ${process.env.CHANNEL_ID || 'Not set'}`);
-  console.log(`   Alert Chat ID: ${ALERT_CHAT_ID || 'Not set'}`);
-  console.log(`   Idle Time: ${IDLE_MS / 60000} minutes`);
-  console.log(`   Business Hours: ${BUSINESS_START_HOUR}:00 - ${BUSINESS_END_HOUR}:00`);
-  console.log(`   Max Alert Time: ${MAX_IDLE_ALERT_MINUTES} minutes`);
+  console.log('\n🔍 SISTEMA DE MONITORAMENTO GLOBAL:');
+  console.log(`   ✅ Monitora TODOS os chats: ${MONITOR_ALL_CHATS}`);
+  console.log(`   👤 Gestora (Manager ID): ${MANAGER_ID}`);
+  console.log(`   ⏰ Tempo limite: ${IDLE_MS / 60000} minutos`);
+  console.log(`   🕰 Horário comercial: ${BUSINESS_START_HOUR}:00 - ${BUSINESS_END_HOUR}:00`);
+  console.log(`   💬 Chat backup: ${ALERT_CHAT_ID || 'Not set'}`);
   
-  if (!ALERT_CHAT_ID) {
-    console.log('\n⚠️  WARNING: ALERT_CHAT_ID not configured!');
-    console.log('   Alerts will use fallback methods only.');
+  if (!MANAGER_ID) {
+    console.log('\n⚠️  WARNING: MANAGER_ID not configured!');
+    console.log('   Sistema não conseguirá notificar gestora.');
+  } else {
+    console.log('\n✅ Sistema configurado para monitorar TODOS os chats!');
+    console.log('   Qualquer cliente não atendido será reportado à gestora.');
   }
   
   console.log('\n💡 Run "npm run setup" if configuration is missing');

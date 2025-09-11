@@ -12,6 +12,13 @@
     "test:webhook:idle": "node tests/webhookTester.js --scenario idle --baseUrl %BASE_URL%",
     "test:webhook:reply": "node tests/webhookTester.js --scenario reply --baseUrl %BASE_URL%",
     "test:webhook:multi": "node tests/webhookTester.js --scenario multi-attendants --baseUrl %BASE_URL%",
+    "test:webhook:analyzer": "node tests/webhookAnalyzer.js",
+    "test:webhook:analyzer:flow": "node tests/webhookAnalyzer.js flow",
+    "test:webhook:analyzer:manager": "node tests/webhookAnalyzer.js manager",
+    "test:webhook:analyzer:bot": "node tests/webhookAnalyzer.js bot",
+    "check:contacts": "node checkAllContacts.js",
+    "check:contacts:watch": "node checkAllContacts.js --watch",
+    "check:contacts:force": "node checkAllContacts.js --force",
     "verify:alerts": "node tests/verifyAlerts.js"
   },
   "dependencies": {
