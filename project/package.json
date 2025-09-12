@@ -19,6 +19,11 @@
     "check:contacts": "node checkAllContacts.js",
     "check:contacts:watch": "node checkAllContacts.js --watch",
     "check:contacts:force": "node checkAllContacts.js --force",
+    "test:attendant:name": "node testAttendantName.js",
+    "test:attendant:all": "node testAttendantName.js --all",
+    "test:attendant:check": "node testAttendantName.js --check",
+    "webhook:receiver": "node webhookReceiver.js",
+    "test:internal:filter": "node testInternalFilter.js",
     "verify:alerts": "node tests/verifyAlerts.js"
   },
   "dependencies": {

@@ -31,8 +31,16 @@ const CONVERSATION_ENDERS = [
   /^(obrigad[oa]\s*(mesmo|demais)?[!.]*)$/i
 ];
 
-// Tags que indicam conversa interna (atendente com atendente)
-const INTERNAL_TAGS = ['interno', 'internal', 'staff', 'equipe', 'atendente'];
+// Tags/setores que indicam conversa interna ou que não devem gerar alertas
+const INTERNAL_TAGS = [
+  'interno', 'internal', 'staff', 'equipe', 'atendente',
+  'processos desp laís', 'autofacil', 'auto facil', 'auto fácil',
+  'particular florianópolis', 'auto vistoria', 'são josé',
+  'equipe particular são josé', 'grupos', 'lojas'
+];
+
+// Emojis que indicam grupos internos
+const INTERNAL_EMOJIS = ['🚙', '🚍', '🐨', '🤍'];
 
 // Middleware
 app.use(bodyParser.json());
@@ -407,7 +415,7 @@ async function checkAndSendDueAlerts(now = Date.now()) {
       // 1. ENVIA PARA WHATSAPP DA GESTORA
       const whatsappResult = await notifyManagerAboutUnattendedClient(conversationData);
       
-      // 2. ENVIA WEBHOOK PARA APLICAÇÃO TERCEIRA
+      // 2. ENVIA WEBHOOK PARA APLICAÇÃO TERCEIRA (PADRÃO UMBLER)
       const webhookResult = await notifyThirdPartyWebhook(conversationData);
       
       if (whatsappResult.success || webhookResult.success) {
@@ -490,11 +498,15 @@ app.post('/api/webhook/utalk', async (req, res) => {
   const startTime = Date.now();
   
   try {
-    // RESPOSTA RÁPIDA CONFORME UMBLER (< 5 segundos)
-    res.status(200).json({ received: true, eventId: req.body?.EventId });
-    
     const event = req.body || {};
-    const attempt = req.headers['x-attempt'] || '1';
+    const attempt = parseInt(req.headers['x-attempt'] || '1');
+    
+    // RESPOSTA IMEDIATA CONFORME UMBLER (< 5 segundos)
+    res.status(200).json({ 
+      received: true, 
+      eventId: event.EventId,
+      timestamp: new Date().toISOString()
+    });
     
     if (WEBHOOK_DEBUG) {
       console.log('=== WEBHOOK UMBLER RECEBIDO ===');
@@ -503,13 +515,34 @@ app.post('/api/webhook/utalk', async (req, res) => {
       console.log('Attempt:', attempt);
       console.log('EventDate:', event.EventDate);
       console.log('Payload Type:', event.Payload?.Type);
+      console.log('Processing Time:', Date.now() - startTime, 'ms');
       console.log('===============================');
     }
 
+    // Processa em background para não afetar tempo de resposta
+    setImmediate(() => processWebhookInBackground(event, attempt));
+    
+  } catch (error) {
+    console.error('Erro no webhook:', error);
+    // Sempre retorna 200 para não causar retry desnecessário
+    if (!res.headersSent) {
+      res.status(200).json({ received: true, error: 'processed' });
+    }
+  }
+});
+
+// ===== PROCESSAMENTO EM BACKGROUND =====
+async function processWebhookInBackground(event, attempt) {
+  try {
     // Processa apenas eventos de Message
     if (event.Type !== 'Message') {
       if (WEBHOOK_DEBUG) console.log('Ignorando evento não-Message:', event.Type);
       return;
+    }
+    
+    // Log de retry se necessário
+    if (attempt > 1) {
+      console.log(`🔄 Reprocessando evento ${event.EventId} - Tentativa ${attempt}`);
     }
 
     const webhookData = extractUmblerWebhookData(event);
@@ -525,9 +558,9 @@ app.post('/api/webhook/utalk', async (req, res) => {
       return;
     }
     
-    // Ignora conversas internas (atendente com atendente)
+    // Ignora conversas internas (atendente com atendente, grupos, setores específicos)
     if (webhookData.isInternal) {
-      if (WEBHOOK_DEBUG) console.log('Ignorando conversa interna (atendente com atendente)');
+      if (WEBHOOK_DEBUG) console.log('Ignorando conversa interna/grupo:', webhookData.sector, webhookData.fromName);
       return;
     }
     
@@ -712,10 +745,14 @@ app.post('/api/webhook/utalk', async (req, res) => {
 
     
   } catch (error) {
-    console.error('Erro no webhook:', error);
-    // Já respondeu no início, apenas loga o erro
+    console.error(`❌ Erro processando webhook ${event.EventId}:`, error.message);
+    
+    // Se falhar muito, pode ser pausado automaticamente pelo Umbler
+    if (attempt >= 3) {
+      console.error(`⚠️ Webhook ${event.EventId} falhou ${attempt} vezes - pode ser pausado`);
+    }
   }
-});
+}
 
 // Função para extrair dados do webhook Umbler Talk 2.0
 function extractUmblerWebhookData(event) {
@@ -745,10 +782,17 @@ function extractUmblerWebhookData(event) {
   fromName = content.Contact?.Name;
   sector = content.Sector?.Name || 'Geral';
   
-  // Extrai tags/etiquetas
+  // Extrai tags/etiquetas e verifica se é interno
   const tags = content.Tags || [];
   const tagNames = tags.map(tag => (tag.Name || tag.name || '').toLowerCase());
-  const isInternal = tagNames.some(tag => INTERNAL_TAGS.includes(tag));
+  const sectorName = (sector || '').toLowerCase();
+  const contactName = (fromName || '').toLowerCase();
+  
+  // Verifica se é conversa interna por tag, setor, nome ou emoji
+  const isInternal = tagNames.some(tag => INTERNAL_TAGS.some(internal => tag.includes(internal))) ||
+                    INTERNAL_TAGS.some(internal => sectorName.includes(internal)) ||
+                    INTERNAL_TAGS.some(internal => contactName.includes(internal)) ||
+                    INTERNAL_EMOJIS.some(emoji => sectorName.includes(emoji) || contactName.includes(emoji));
   
   // Dados da mensagem
   messageText = lastMessage.Content || lastMessage.Text;
@@ -1224,8 +1268,8 @@ app.post('/api/test/simulate-any-chat', async (req, res) => {
 
 // ===== NOTIFICAÇÃO PARA APLICAÇÕES TERCEIRAS =====
 
-// Envia webhook para aplicação terceira (Paola)
-async function notifyThirdPartyWebhook(alertData) {
+// Envia webhook para aplicação terceira seguindo padrão Umbler
+async function notifyThirdPartyWebhook(alertData, attempt = 1) {
   const webhookUrl = process.env.MANAGER1_WEBHOOK;
   
   if (!webhookUrl) {
@@ -1233,19 +1277,30 @@ async function notifyThirdPartyWebhook(alertData) {
     return { success: false, error: 'Webhook URL not configured' };
   }
 
+  const eventId = `ALERT_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  
+  // Payload seguindo estrutura Umbler Talk 2.0
   const webhookPayload = {
     Type: 'ClientUnattended',
     EventDate: new Date().toISOString(),
-    EventId: `ALERT_${Date.now()}`,
+    EventId: eventId,
     Payload: {
       Type: 'Alert',
       Content: {
+        Id: alertData.conversationId || alertData.key,
         ClientName: alertData.clientName,
         ConversationId: alertData.conversationId || alertData.key,
+        AttendantId: alertData.attendantId,
         AttendantName: alertData.attendantName,
         Sector: alertData.sector,
         IdleMinutes: alertData.idleMinutes,
         Link: alertData.link,
+        Tags: alertData.tags || [],
+        BusinessHours: {
+          start: BUSINESS_START_HOUR,
+          end: BUSINESS_END_HOUR,
+          current: new Date().getHours()
+        },
         Timestamp: new Date().toISOString()
       }
     }
@@ -1254,19 +1309,34 @@ async function notifyThirdPartyWebhook(alertData) {
   try {
     const axios = require('axios');
     const response = await axios.post(webhookUrl, webhookPayload, {
-      timeout: 4000, // < 5 segundos conforme Umbler
+      timeout: 4500, // < 5 segundos conforme Umbler
       headers: {
         'Content-Type': 'application/json',
-        'User-Agent': 'UTalk-Bot-Webhook/1.0'
+        'User-Agent': 'UTalk-Bot-Webhook/2.0',
+        'x-attempt': attempt.toString(),
+        'x-event-id': eventId
       }
     });
     
-    console.log(`✅ Webhook terceiro enviado: ${response.status}`);
-    return { success: true, status: response.status };
+    // Verifica se resposta está no range 200-299
+    if (response.status >= 200 && response.status <= 299) {
+      console.log(`✅ Webhook terceiro enviado: ${response.status} (tentativa ${attempt})`);
+      return { success: true, status: response.status, eventId };
+    } else {
+      throw new Error(`Status inválido: ${response.status}`);
+    }
     
   } catch (error) {
-    console.error(`❌ Erro webhook terceiro:`, error.message);
-    return { success: false, error: error.message };
+    console.error(`❌ Erro webhook terceiro (tentativa ${attempt}):`, error.message);
+    
+    // Retry automático até 2 tentativas (conforme Umbler)
+    if (attempt < 3) {
+      console.log(`🔄 Tentando novamente em 2 segundos... (${attempt + 1}/3)`);
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      return await notifyThirdPartyWebhook(alertData, attempt + 1);
+    }
+    
+    return { success: false, error: error.message, attempts: attempt, eventId };
   }
 }
 
